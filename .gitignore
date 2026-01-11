@@ -1,0 +1,57 @@
+# Pi Car Monitor - Git Ignore
+# ============================
+# IMPORTANT: This protects your private data from being committed
+
+# Sensitive configuration (contains secrets and car details)
+config/config.yaml
+config/car_profile.yaml
+config/.plate_salt
+config/.owner_profile
+
+# Recordings (video footage)
+data/recordings/
+data/calibration/
+data/debug/
+
+# Logs (may contain sensitive info)
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models (too large for git)
+models/custom/*.hef
+models/*.hef
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Claude Code
+.claude/

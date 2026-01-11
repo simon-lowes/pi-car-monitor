@@ -1,0 +1,77 @@
+alerts:
+  enabled: true
+  local_sound:
+    enabled: false
+    sound_file: /home/PiAi/pi-car-monitor/assets/alert.wav
+  telegram:
+    enabled: true
+    bot_token: "YOUR_BOT_TOKEN"
+    chat_id: "YOUR_CHAT_ID"
+    send_on_start: true
+    send_video_on_end: true
+    max_chunk_size_mb: 50
+camera:
+  device: /dev/video0
+  framerate: 15
+  resolution:
+    height: 1080
+    width: 1920
+debug:
+  debug_frame_dir: /home/PiAi/pi-car-monitor/data/debug
+  display_output: false
+  enabled: false
+  save_debug_frames: false
+detection:
+  car_confidence: 0.85
+  contact_confidence: 0.7
+  contact_dwell_time: 1.5
+  proximity_confidence: 0.6
+  trackable_objects:
+  - person
+  - bicycle
+  - motorcycle
+  - car
+  - truck
+  - dog
+logging:
+  events_db: /home/PiAi/pi-car-monitor/logs/events.db
+  file: /home/PiAi/pi-car-monitor/logs/car-monitor.log
+  level: INFO
+  log_contacts: true
+  log_detections: true
+  log_proximity: true
+  log_recordings: true
+performance:
+  batch_size: 1
+  detection_frame_skip: 2
+  hailo_device: /dev/hailo0
+  proximity_frame_skip: 1
+  use_hailo: true
+plate_recognition:
+  enabled: true
+  hash_algorithm: sha256
+  local_only: true
+  salt_file: /home/PiAi/pi-car-monitor/config/.plate_salt
+  store_hash_only: true
+recording:
+  auto_delete_days: 30
+  codec: h264
+  format: mp4
+  max_duration_seconds: 300
+  max_storage_gb: 100
+  output_dir: /home/PiAi/pi-car-monitor/data/recordings
+  post_buffer_seconds: 5
+  pre_buffer_seconds: 10
+owner_recognition:
+  enabled: true
+  learning_enabled: true
+  profile_path: /home/PiAi/pi-car-monitor/config/.owner_profile
+  confidence_threshold: 0.7
+zones:
+  car_zone:
+    enabled: true
+    x_max: 0.9
+    x_min: 0.1
+    y_max: 0.95
+    y_min: 0.2
+  proximity_buffer: 75

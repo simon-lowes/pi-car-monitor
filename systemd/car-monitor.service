@@ -1,0 +1,29 @@
+[Unit]
+Description=Pi Car Monitor - Privacy-First Car Security
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=PiAi
+Group=PiAi
+WorkingDirectory=/home/PiAi/pi-car-monitor
+ExecStart=/home/PiAi/pi-car-monitor/venv/bin/python src/main.py
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/PiAi/pi-car-monitor/data /home/PiAi/pi-car-monitor/logs
+PrivateTmp=true
+
+# Allow access to camera and Hailo
+SupplementaryGroups=video
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

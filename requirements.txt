@@ -1,0 +1,37 @@
+# Pi Car Monitor - Python Dependencies
+# =====================================
+
+# Core
+numpy>=1.24.0
+pyyaml>=6.0
+opencv-python>=4.8.0
+
+# Hailo Runtime (installed via apt, but listed for reference)
+# hailo-platform
+
+# Video pipeline
+# Note: PyGObject for GStreamer bindings
+PyGObject>=3.42.0
+
+# Database
+# SQLite is built into Python, but we use aiosqlite for async
+aiosqlite>=0.19.0
+
+# Image processing
+Pillow>=10.0.0
+
+# Utilities
+python-dateutil>=2.8.0
+watchdog>=3.0.0  # For file monitoring
+
+# Optional: For reference image collection
+requests>=2.28.0
+
+# Optional: For web dashboard
+# flask>=2.3.0
+# flask-socketio>=5.3.0
+
+# Development
+# pytest>=7.0.0
+# black>=23.0.0
+# mypy>=1.0.0
