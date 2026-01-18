@@ -265,11 +265,11 @@ class HailoModel:
                         f"size: {input_data.nbytes} bytes, contiguous: {input_data.flags['C_CONTIGUOUS']}")
             logger.debug(f"Input name: {input_name}, expected shape: {self._input_shape}")
 
-            # Create vstream params
+            # Create vstream params - use UINT8 input as model expects
             input_vstream_params = InputVStreamParams.make_from_network_group(
                 self._network_group,
-                quantized=False,
-                format_type=FormatType.FLOAT32
+                quantized=True,
+                format_type=FormatType.UINT8
             )
             output_vstream_params = OutputVStreamParams.make_from_network_group(
                 self._network_group,
@@ -306,13 +306,15 @@ class HailoModel:
             image: BGR image (H, W, C)
 
         Returns:
-            Preprocessed tensor (1, H, W, C) or (1, C, H, W)
+            Preprocessed tensor (1, H, W, C) as UINT8
         """
         import cv2
 
         # Get target size from input shape
-        # Shape is typically (batch, height, width, channels) or (batch, channels, height, width)
-        if len(self._input_shape) == 4:
+        # Shape is typically (height, width, channels) for Hailo
+        if len(self._input_shape) == 3:
+            target_h, target_w = self._input_shape[0], self._input_shape[1]
+        elif len(self._input_shape) == 4:
             if self._input_shape[3] == 3:  # NHWC
                 target_h, target_w = self._input_shape[1], self._input_shape[2]
             else:  # NCHW
@@ -326,14 +328,9 @@ class HailoModel:
         # Convert BGR to RGB
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
-        # Normalize to 0-1
-        normalized = rgb.astype(np.float32) / 255.0
-
-        # Hailo InferVStreams requires shape (batch, H, W, C) with proper strides
-        # The first stride must equal the full single-image size in bytes
-        # Create as (1, H, W, C) from the start to ensure correct memory layout
-        batched = np.zeros((1,) + normalized.shape, dtype=np.float32)
-        batched[0] = normalized
+        # Keep as UINT8 - Hailo model expects UINT8 input!
+        # Hailo InferVStreams requires shape (batch, H, W, C)
+        batched = np.expand_dims(rgb, axis=0).astype(np.uint8)
 
         return batched
 
@@ -399,6 +396,7 @@ def postprocess_yolov8_detections(
                         continue
 
                     # class_detections shape: (N, 5) = [x1, y1, x2, y2, conf]
+                    # Hailo NMS outputs normalized coords (0-1)
                     for det in class_detections:
                         if len(det) < 5:
                             continue
@@ -408,15 +406,12 @@ def postprocess_yolov8_detections(
                         if conf < conf_threshold:
                             continue
 
-                        # Scale bbox to original image size
-                        scale_x = orig_shape[1] / input_shape[1]
-                        scale_y = orig_shape[0] / input_shape[0]
-
+                        # Coords are normalized (0-1), scale directly to original image
                         bbox = (
-                            int(x1 * scale_x),
-                            int(y1 * scale_y),
-                            int(x2 * scale_x),
-                            int(y2 * scale_y)
+                            int(x1 * orig_shape[1]),
+                            int(y1 * orig_shape[0]),
+                            int(x2 * orig_shape[1]),
+                            int(y2 * orig_shape[0])
                         )
 
                         detections.append({

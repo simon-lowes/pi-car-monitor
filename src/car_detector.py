@@ -108,21 +108,23 @@ class CarDetector:
     def detect(self, frame: np.ndarray) -> Optional[CarDetection]:
         """
         Process a frame and detect if the target car is present.
-        
+
         Args:
             frame: BGR image as numpy array
-            
+
         Returns:
             CarDetection if target car found, None otherwise
         """
         frame_h, frame_w = frame.shape[:2]
-        
+
         # Run vehicle detection
         vehicles = self._detect_vehicles(frame)
-        
+
         if not vehicles:
             self._update_state(None)
             return None
+
+        logger.debug(f"Detected {len(vehicles)} vehicle(s) in frame")
         
         # Filter to detection zone if enabled
         if self.zone_enabled:
@@ -153,7 +155,17 @@ class CarDetector:
         outputs = self.hailo.run_inference(model_name, frame)
 
         if outputs is None:
+            logger.warning("Hailo inference returned None")
             return []
+
+        # Log output structure for debugging
+        for key, val in outputs.items():
+            if isinstance(val, list):
+                logger.debug(f"Output '{key}': list with {len(val)} items")
+                if val and isinstance(val[0], list):
+                    logger.debug(f"  First item has {len(val[0])} class arrays")
+            elif hasattr(val, 'shape'):
+                logger.debug(f"Output '{key}': array shape {val.shape}")
 
         # Postprocess detections
         frame_h, frame_w = frame.shape[:2]
@@ -162,6 +174,11 @@ class CarDetector:
             conf_threshold=self.config.get("detection", {}).get("proximity_confidence", 0.5),
             orig_shape=(frame_h, frame_w)
         )
+
+        # Log all detections before filtering
+        if detections:
+            det_summary = [(d['class'], round(d['confidence'], 2)) for d in detections]
+            logger.debug(f"Raw detections: {det_summary}")
 
         # Filter to vehicle classes only
         vehicle_classes = {'car', 'truck', 'bus', 'motorcycle'}
@@ -229,16 +246,18 @@ class CarDetector:
         colour_score = self._match_colour(vehicle_crop)
         if colour_score >= self.colour_threshold:
             match_reasons.append(f"colour_match:{colour_score:.2f}")
-        
+        logger.debug(f"Vehicle colour score: {colour_score:.2f} (threshold: {self.colour_threshold})")
+
         # 3. Model/shape matching (if custom model available)
         model_score = self._match_model(vehicle_crop)
         if model_score >= self.model_threshold:
             match_reasons.append(f"model_match:{model_score:.2f}")
+        logger.debug(f"Model score: {model_score:.2f} (threshold: {self.model_threshold})")
         
         # Determine if this is the target car
         is_target = False
         final_confidence = confidence
-        
+
         if plate_verified:
             is_target = True
             final_confidence = 1.0
@@ -249,7 +268,17 @@ class CarDetector:
             # Very high single-factor match
             is_target = True
             final_confidence = max(colour_score, model_score)
-        
+        elif colour_score >= self.colour_threshold and self.zone_enabled:
+            # Fallback: colour match + in designated zone = likely target car
+            # This allows detection when plate/model matching unavailable
+            is_target = True
+            final_confidence = colour_score * 0.9  # Slightly lower confidence
+            match_reasons.append("zone_fallback")
+            logger.debug(f"Zone fallback triggered: colour {colour_score:.2f} in zone")
+
+        if is_target:
+            logger.info(f"Target car detected! Confidence: {final_confidence:.2f}, reasons: {match_reasons}")
+
         return CarDetection(
             bbox=bbox,
             confidence=final_confidence,
@@ -308,7 +337,8 @@ class CarDetector:
             # Handle achromatic colours (white, black, silver, grey)
             if target_colour in ['white', 'silver', 'grey', 'gray']:
                 # Low saturation indicates achromatic
-                if detected_sat < 40:
+                # Use higher threshold (60) to tolerate reflections from environment
+                if detected_sat < 60:
                     if target_colour == 'white' and detected_val > 180:
                         return 0.9
                     elif target_colour in ['silver', 'grey', 'gray'] and 80 < detected_val < 180:

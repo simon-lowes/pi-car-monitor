@@ -266,7 +266,13 @@ class CarMonitorPipeline:
                 
                 # Stage 1: Car Detection
                 car_detection = self.car_detector.detect(frame)
-                
+
+                # Log status every 150 frames (~10 seconds at 15fps)
+                if self.frame_count % 150 == 0:
+                    logger.info(f"Status: state={self.current_state}, frames={self.frame_count}, "
+                               f"car_in_frame={self.car_detector.car_in_frame}, "
+                               f"detections={self.car_detector.consecutive_detections}")
+
                 if not self.car_detector.car_in_frame:
                     # Car not in frame, nothing to monitor
                     self.current_state = "waiting_for_car"
