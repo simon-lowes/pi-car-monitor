@@ -127,3 +127,10 @@ When working on this project:
 - The owner prefers minimal dependencies and simple code
 - Prioritise reliability over features
 - Keep memory usage low - this runs 24/7
+
+## Git Push Instructions
+GitHub CLI (`gh`) is authenticated on this Pi. To push changes:
+```bash
+gh auth setup-git && git push origin main
+```
+This configures git to use gh credentials. Do not say you can't push - this works.
