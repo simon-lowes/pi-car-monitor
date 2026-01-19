@@ -557,3 +557,128 @@ def _iou(box1: Tuple, box2: Tuple) -> float:
     union = area1 + area2 - intersection
 
     return intersection / union if union > 0 else 0.0
+
+
+def postprocess_yolov8_pose(
+    outputs: Dict,
+    conf_threshold: float = 0.5,
+    input_shape: Tuple[int, int] = (640, 640),
+    orig_shape: Tuple[int, int] = (1080, 1920)
+) -> List[Dict]:
+    """
+    Postprocess YOLOv8 pose estimation outputs.
+
+    Args:
+        outputs: Raw model outputs from pose model
+        conf_threshold: Confidence threshold for person detection
+        input_shape: Model input size (H, W)
+        orig_shape: Original image size (H, W)
+
+    Returns:
+        List of pose detections with keys: bbox, confidence, keypoints
+        keypoints is a dict with named keypoints (e.g. 'left_wrist': [x, y, conf])
+    """
+    # COCO keypoint names (17 keypoints)
+    KEYPOINT_NAMES = [
+        'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
+        'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
+        'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
+        'left_knee', 'right_knee', 'left_ankle', 'right_ankle'
+    ]
+
+    poses = []
+
+    try:
+        output_name = list(outputs.keys())[0]
+        output = outputs[output_name]
+
+        if output is None:
+            return []
+
+        # Handle Hailo NMS output format for pose: list[batch][class_id] = array(N, 56)
+        # Each detection: [x1, y1, x2, y2, conf, kp1_x, kp1_y, kp1_conf, ...]
+        if isinstance(output, list) and len(output) > 0:
+            batch_output = output[0]
+
+            if isinstance(batch_output, list) and len(batch_output) > 0:
+                # Class 0 is person for pose model
+                person_detections = batch_output[0] if len(batch_output) > 0 else []
+
+                if isinstance(person_detections, np.ndarray) and person_detections.size > 0:
+                    for det in person_detections:
+                        if len(det) < 5:
+                            continue
+
+                        x1, y1, x2, y2, conf = det[:5]
+
+                        if conf < conf_threshold:
+                            continue
+
+                        # Scale bbox to original image (coords are normalized 0-1)
+                        bbox = (
+                            int(x1 * orig_shape[1]),
+                            int(y1 * orig_shape[0]),
+                            int(x2 * orig_shape[1]),
+                            int(y2 * orig_shape[0])
+                        )
+
+                        # Extract keypoints (starting at index 5)
+                        keypoints = {}
+                        kp_data = det[5:]
+
+                        for i, name in enumerate(KEYPOINT_NAMES):
+                            idx = i * 3
+                            if idx + 2 < len(kp_data):
+                                kp_x = kp_data[idx] * orig_shape[1]
+                                kp_y = kp_data[idx + 1] * orig_shape[0]
+                                kp_conf = kp_data[idx + 2]
+                                keypoints[name] = [int(kp_x), int(kp_y), float(kp_conf)]
+
+                        poses.append({
+                            'bbox': bbox,
+                            'confidence': float(conf),
+                            'keypoints': keypoints
+                        })
+
+                    return poses
+
+        # Fallback for array outputs
+        if hasattr(output, 'squeeze'):
+            output = np.squeeze(output)
+
+        if len(output.shape) == 2 and output.shape[1] >= 56:
+            # Format: (N, 56) where 56 = 5 (box+conf) + 17*3 (keypoints)
+            for det in output:
+                conf = det[4]
+                if conf < conf_threshold:
+                    continue
+
+                scale_x = orig_shape[1] / input_shape[1]
+                scale_y = orig_shape[0] / input_shape[0]
+
+                bbox = (
+                    int(det[0] * scale_x),
+                    int(det[1] * scale_y),
+                    int(det[2] * scale_x),
+                    int(det[3] * scale_y)
+                )
+
+                keypoints = {}
+                for i, name in enumerate(KEYPOINT_NAMES):
+                    idx = 5 + i * 3
+                    if idx + 2 < len(det):
+                        kp_x = det[idx] * scale_x
+                        kp_y = det[idx + 1] * scale_y
+                        kp_conf = det[idx + 2]
+                        keypoints[name] = [int(kp_x), int(kp_y), float(kp_conf)]
+
+                poses.append({
+                    'bbox': bbox,
+                    'confidence': float(conf),
+                    'keypoints': keypoints
+                })
+
+    except Exception as e:
+        logger.error(f"Pose postprocessing error: {e}")
+
+    return poses

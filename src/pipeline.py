@@ -23,7 +23,7 @@ from proximity_tracker import ProximityTracker
 from contact_classifier import ContactClassifier, ContactType
 from recorder import CircularRecorder
 from database import EventDatabase
-from utils.hailo_utils import HailoDevice
+from utils.hailo_utils import HailoDevice, postprocess_yolov8_pose
 from telegram_notifier import TelegramNotifier, create_notifier_from_config
 from owner_profile import OwnerProfile, create_profile_from_config
 
@@ -292,11 +292,29 @@ class CarMonitorPipeline:
                     self.stats["proximity_events"] += 1
                     self.current_state = "proximity_detected"
 
+                # Run pose estimation if persons are nearby
+                poses = None
+                persons_nearby = [obj for obj in nearby_objects if obj.get('class') == 'person']
+                if persons_nearby and 'pose' in self.hailo.models:
+                    try:
+                        pose_outputs = self.hailo.run_inference('pose', frame)
+                        if pose_outputs:
+                            frame_h, frame_w = frame.shape[:2]
+                            poses = postprocess_yolov8_pose(
+                                pose_outputs,
+                                conf_threshold=0.5,
+                                orig_shape=(frame_h, frame_w)
+                            )
+                            if poses:
+                                logger.debug(f"Pose estimation: {len(poses)} person(s) detected")
+                    except Exception as e:
+                        logger.warning(f"Pose estimation failed: {e}")
+
                 # Stage 3: Contact Classification
                 contacts = self.contact_classifier.process_frame(
-                    frame, 
+                    frame,
                     nearby_objects,
-                    poses=None,  # Would come from pose model
+                    poses=poses,
                     timestamp=timestamp
                 )
                 

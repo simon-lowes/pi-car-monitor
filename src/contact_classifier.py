@@ -156,28 +156,25 @@ class ContactClassifier:
     
     def _update_tracking(self, detections: list, poses: Optional[list]):
         """Update tracked persons with new detections."""
-        # TODO: Implement proper tracking (e.g., SORT, DeepSORT)
-        # For now, simplified tracking based on position
-        
         current_ids = set()
-        
+
         for i, det in enumerate(detections):
             if det.get('class') != 'person':
                 continue
-                
+
             bbox = det['bbox']
             track_id = det.get('track_id', i)
             current_ids.add(track_id)
-            
-            # Get pose keypoints if available
+
+            # Match pose to this person by bbox overlap
             keypoints = None
-            if poses and i < len(poses):
-                keypoints = poses[i]
-            
+            if poses:
+                keypoints = self._match_pose_to_person(bbox, poses)
+
             # Calculate distance to car
             car_bbox = self.get_car_bbox()
             distance = self._calculate_distance(bbox, car_bbox) if car_bbox else float('inf')
-            
+
             if track_id in self.tracked_persons:
                 # Update existing
                 person = self.tracked_persons[track_id]
@@ -185,7 +182,7 @@ class ContactClassifier:
                 person.keypoints = keypoints
                 person.distance_to_car = distance
                 person.frames_in_proximity += 1
-                
+
                 # Track hand positions for gesture analysis
                 if keypoints:
                     hands = self._extract_hand_positions(keypoints)
@@ -197,7 +194,7 @@ class ContactClassifier:
                 hand_positions = []
                 if keypoints:
                     hand_positions = self._extract_hand_positions(keypoints)
-                
+
                 self.tracked_persons[track_id] = TrackedPerson(
                     track_id=track_id,
                     bbox=bbox,
@@ -206,11 +203,46 @@ class ContactClassifier:
                     frames_in_proximity=1,
                     hand_positions=hand_positions
                 )
-        
+
         # Remove persons who left the scene
         for track_id in list(self.tracked_persons.keys()):
             if track_id not in current_ids:
                 del self.tracked_persons[track_id]
+
+    def _match_pose_to_person(self, person_bbox: tuple, poses: list) -> Optional[dict]:
+        """Match a pose detection to a person by bbox overlap."""
+        best_match = None
+        best_iou = 0.3  # Minimum IoU threshold
+
+        for pose in poses:
+            pose_bbox = pose.get('bbox')
+            if not pose_bbox:
+                continue
+
+            # Calculate IoU between person bbox and pose bbox
+            iou = self._calculate_iou(person_bbox, pose_bbox)
+            if iou > best_iou:
+                best_iou = iou
+                best_match = pose.get('keypoints')
+
+        return best_match
+
+    def _calculate_iou(self, box1: tuple, box2: tuple) -> float:
+        """Calculate IoU between two boxes."""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        intersection = (x2 - x1) * (y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - intersection
+
+        return intersection / union if union > 0 else 0.0
     
     def _check_person_contact(
         self,
@@ -337,11 +369,17 @@ class ContactClassifier:
         for det in detections:
             if det.get('class') not in ['car', 'truck', 'motorcycle', 'bicycle']:
                 continue
-            
+
             other_bbox = det['bbox']
             overlap = self._calculate_overlap(other_bbox, car_bbox)
-            
-            if overlap > 0.05:  # Any significant overlap is concerning
+
+            # Skip self-detections: if overlap is very high (>85%), this is likely
+            # the target car being detected twice by the model, not another vehicle
+            if overlap > 0.85:
+                logger.debug(f"Ignoring vehicle detection with {overlap:.0%} overlap (likely self-detection)")
+                continue
+
+            if overlap > 0.05:  # Partial overlap indicates actual contact
                 return ContactEvent(
                     contact_type=ContactType.VEHICLE_CONTACT,
                     confidence=min(overlap * 5, 1.0),  # Scale confidence by overlap
@@ -349,7 +387,7 @@ class ContactClassifier:
                     actor_id=det.get('track_id'),
                     timestamp=timestamp
                 )
-        
+
         return None
     
     def _check_impact_event(
