@@ -16,6 +16,7 @@ from typing import Optional
 import queue
 
 import cv2
+import numpy as np
 
 from camera import ThreadedCamera
 from car_detector import CarDetector
@@ -26,6 +27,8 @@ from database import EventDatabase
 from utils.hailo_utils import HailoDevice, postprocess_yolov8_pose
 from telegram_notifier import TelegramNotifier, create_notifier_from_config
 from owner_profile import OwnerProfile, create_profile_from_config
+from presence_tracker import PresenceTracker, PresenceState
+from temporal_patterns import TemporalPatternDB, create_pattern_db_from_config
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +106,27 @@ class CarMonitorPipeline:
         if self.owner_profile:
             logger.info(f"Owner recognition enabled ({self.owner_profile.sample_count} samples)")
 
+        # Initialize presence tracker for departure/return detection
+        presence_config = config.get('presence_tracking', {})
+        self.presence_tracking_enabled = presence_config.get('enabled', False)
+        if self.presence_tracking_enabled:
+            baseline_path = presence_config.get(
+                'baseline_path',
+                'data/car_baseline.yaml'
+            )
+            self.presence_tracker = PresenceTracker(config, baseline_path)
+            logger.info(f"Presence tracking enabled, state={self.presence_tracker.state.name}")
+        else:
+            self.presence_tracker = None
+            logger.info("Presence tracking disabled")
+
+        # Initialize temporal pattern learning
+        self.pattern_db = create_pattern_db_from_config(config)
+        if self.pattern_db:
+            logger.info(f"Temporal patterns enabled ({self.pattern_db.get_status()['pattern_count']} patterns)")
+        else:
+            logger.info("Temporal pattern learning disabled")
+
         # Store last frame for snapshot
         self._last_frame = None
         
@@ -124,6 +148,9 @@ class CarMonitorPipeline:
             "contact_events": 0,
             "recordings_triggered": 0,
             "start_time": None,
+            "presence_state_changes": 0,
+            "departures_detected": 0,
+            "returns_detected": 0,
         }
     
     def start(self):
@@ -267,17 +294,133 @@ class CarMonitorPipeline:
                 # Stage 1: Car Detection
                 car_detection = self.car_detector.detect(frame)
 
+                # Early person/pose detection for departure tracking
+                # Run this before presence tracking so we can identify who's getting in the car
+                early_person_detections = None
+                early_pose_detections = None
+
+                if self.presence_tracking_enabled and self.presence_tracker:
+                    # Only run early detection if in relevant states and car zone known
+                    presence_state = self.presence_tracker.state
+                    if presence_state in [PresenceState.PRESENT, PresenceState.DEPARTING]:
+                        if self.presence_tracker.baseline:
+                            # Run person detection using proximity tracker's detector
+                            try:
+                                from utils.hailo_utils import postprocess_yolov8_detections
+                                outputs = self.hailo.run_inference('detector', frame)
+                                if outputs:
+                                    frame_h, frame_w = frame.shape[:2]
+                                    all_detections = postprocess_yolov8_detections(
+                                        outputs,
+                                        conf_threshold=0.5,
+                                        orig_shape=(frame_h, frame_w)
+                                    )
+                                    # Filter to persons only
+                                    early_person_detections = [
+                                        d for d in all_detections if d.get('class') == 'person'
+                                    ]
+
+                                    # Run pose if persons found
+                                    if early_person_detections and 'pose' in self.hailo.models:
+                                        pose_outputs = self.hailo.run_inference('pose', frame)
+                                        if pose_outputs:
+                                            early_pose_detections = postprocess_yolov8_pose(
+                                                pose_outputs,
+                                                conf_threshold=0.5,
+                                                orig_shape=(frame_h, frame_w)
+                                            )
+                            except Exception as e:
+                                logger.debug(f"Early person detection failed: {e}")
+
+                # Stage 0 (runs after detection): Presence Tracking
+                presence_result = None
+                if self.presence_tracking_enabled and self.presence_tracker:
+                    presence_result = self.presence_tracker.process_frame(
+                        frame=frame,
+                        car_detected=self.car_detector.car_in_frame,
+                        car_bbox=self.car_detector.car_bbox,
+                        car_confidence=car_detection.confidence if car_detection else 0.0,
+                        car_stable=self.car_detector.detection_stable,
+                        person_detections=early_person_detections,
+                        pose_detections=early_pose_detections
+                    )
+
+                    # Handle presence state changes
+                    if presence_result.get('state_changed'):
+                        self.stats["presence_state_changes"] += 1
+                        new_state = presence_result['state']
+
+                        if new_state == PresenceState.DEPARTING:
+                            self.stats["departures_detected"] += 1
+                            logger.info("Car departure detected!")
+
+                            # Check if we can identify the owner
+                            owner_confidence = self._check_owner_at_departure(presence_result)
+                            presence_result['owner_match_confidence'] = owner_confidence
+
+                            # Check for temporal pattern match
+                            pattern_match = None
+                            if self.pattern_db:
+                                is_expected, pattern = self.pattern_db.is_expected_departure(datetime.now())
+                                if is_expected and pattern:
+                                    pattern_match = pattern
+                                    presence_result['pattern_match'] = pattern
+                                    logger.info(f"Departure matches pattern: {pattern}")
+
+                            # Determine if alert should be suppressed
+                            should_suppress = False
+                            if pattern_match:
+                                temporal_config = self.config.get('temporal_patterns', {})
+                                suppress_threshold = temporal_config.get('suppress_confidence_threshold', 0.85)
+                                min_confirmations = temporal_config.get('suppress_alerts_after_confirmations', 10)
+
+                                if (pattern_match.confidence >= suppress_threshold and
+                                    pattern_match.occurrence_count >= min_confirmations):
+                                    # Also need high owner confidence to suppress
+                                    if owner_confidence and owner_confidence >= 0.7:
+                                        should_suppress = True
+                                        logger.info("Alert suppressed (expected pattern + owner identified)")
+
+                            # Send departure alert via Telegram
+                            if self.notifier and presence_result.get('should_alert') and not should_suppress:
+                                self._send_departure_alert(frame, presence_result)
+                            elif should_suppress:
+                                logger.info("Departure alert suppressed due to learned pattern")
+
+                        elif new_state == PresenceState.ABSENT:
+                            logger.info("Car confirmed absent")
+
+                        elif new_state == PresenceState.RETURNING:
+                            logger.info("Car returning!")
+
+                        elif new_state == PresenceState.PRESENT:
+                            if presence_result.get('alert_reason') == 'car_returned':
+                                self.stats["returns_detected"] += 1
+                                logger.info("Car has returned and parked")
+
+                                # Record return time for pattern learning
+                                if self.pattern_db:
+                                    duration = self.pattern_db.record_return(datetime.now())
+                                    if duration:
+                                        logger.info(f"Trip duration recorded: {duration} minutes")
+
+                                # Send return alert via Telegram
+                                if self.notifier and presence_result.get('should_alert'):
+                                    self._send_return_alert(frame, presence_result)
+
                 # Log status every 150 frames (~10 seconds at 15fps)
                 if self.frame_count % 150 == 0:
-                    logger.info(f"Status: state={self.current_state}, frames={self.frame_count}, "
-                               f"car_in_frame={self.car_detector.car_in_frame}, "
+                    presence_state = self.presence_tracker.state.name if self.presence_tracker else "disabled"
+                    logger.info(f"Status: state={self.current_state}, presence={presence_state}, "
+                               f"frames={self.frame_count}, car_in_frame={self.car_detector.car_in_frame}, "
                                f"detections={self.car_detector.consecutive_detections}")
 
                 if not self.car_detector.car_in_frame:
-                    # Car not in frame, nothing to monitor
+                    # Car not in frame, nothing to monitor for contact
+                    # But presence tracker may still be working (ABSENT/RETURNING states)
                     self.current_state = "waiting_for_car"
                     continue
-                
+
                 self.stats["car_detections"] += 1
                 self.current_state = "car_detected"
 
@@ -438,34 +581,227 @@ class CarMonitorPipeline:
         Callback when user replies 'me' to an alert.
 
         Adds the event's appearance data to owner profile.
+        Records the departure for temporal pattern learning.
         """
-        if not self.owner_profile:
+        # Confirm owner in profile
+        if self.owner_profile:
+            # Confirm the event (uses latest if event_id is 0)
+            event_id_to_use = event_id if event_id > 0 else None
+
+            if self.owner_profile.confirm_owner(event_id=event_id_to_use):
+                logger.info("Owner confirmation recorded")
+
+                # Log how many samples we have now
+                sample_count = self.owner_profile.sample_count
+                if sample_count >= 3:
+                    logger.info(f"Owner profile trained with {sample_count} samples")
+                else:
+                    logger.info(f"Owner profile has {sample_count}/3 samples needed for recognition")
+
+        # Record departure for temporal pattern learning
+        if self.pattern_db:
+            # Get owner confidence from the last departure actor if available
+            owner_confidence = None
+            light_conditions = None
+
+            if self.presence_tracker and self.presence_tracker.last_departure_actor:
+                actor = self.presence_tracker.last_departure_actor
+                if actor.features:
+                    owner_confidence = actor.features.confidence
+
+            # Record the departure as confirmed owner
+            self.pattern_db.record_departure(
+                timestamp=datetime.now(),
+                was_owner=True,
+                owner_confidence=owner_confidence,
+                light_conditions=light_conditions
+            )
+            logger.info("Departure recorded for pattern learning")
+
+    def _check_owner_at_departure(self, presence_result: dict) -> Optional[float]:
+        """
+        Check if the departing actor matches the owner profile.
+
+        Returns owner match confidence or None if no match attempted.
+        """
+        if not self.owner_profile or not self.owner_profile.is_trained:
+            return None
+
+        departure_actor = presence_result.get('departure_actor')
+        if not departure_actor or not departure_actor.features:
+            return None
+
+        feature_vector = departure_actor.features.feature_vector
+        if feature_vector is None:
+            return None
+
+        try:
+            confidence = self.owner_profile.match(feature_vector)
+            is_owner = confidence >= self.owner_profile.confidence_threshold
+
+            if is_owner:
+                logger.info(f"Owner identified at departure (confidence: {confidence:.2f})")
+            else:
+                logger.info(f"Unknown person at departure (confidence: {confidence:.2f})")
+
+            # Store actor data for potential training if user confirms
+            if self.owner_profile and departure_actor:
+                event_id = self.owner_profile.create_event(
+                    features=feature_vector,
+                    timestamp=departure_actor.first_seen
+                )
+                # Store snapshot path if we have one
+                if hasattr(departure_actor, 'snapshot') and departure_actor.snapshot is not None:
+                    try:
+                        snapshot_dir = Path("data/departure_snapshots")
+                        snapshot_dir.mkdir(parents=True, exist_ok=True)
+                        snapshot_path = snapshot_dir / f"departure_{event_id}_{int(time.time())}.jpg"
+                        cv2.imwrite(str(snapshot_path), departure_actor.snapshot)
+                        event = self.owner_profile.get_event(event_id)
+                        if event:
+                            event['snapshot_path'] = str(snapshot_path)
+                    except Exception as e:
+                        logger.debug(f"Failed to save departure snapshot: {e}")
+
+            return confidence
+
+        except Exception as e:
+            logger.error(f"Owner check failed: {e}")
+            return None
+
+    def _send_departure_alert(self, frame: np.ndarray, presence_result: dict):
+        """Send a departure alert via Telegram."""
+        if not self.notifier:
             return
 
-        # Confirm the event (uses latest if event_id is 0)
-        event_id_to_use = event_id if event_id > 0 else None
+        try:
+            # Prepare snapshot
+            frame_jpeg = None
+            if frame is not None:
+                _, jpeg_data = cv2.imencode('.jpg', frame)
+                frame_jpeg = jpeg_data.tobytes()
 
-        if self.owner_profile.confirm_owner(event_id=event_id_to_use):
-            logger.info("Owner confirmation recorded")
+            # Build message
+            signals = presence_result.get('departure_signals', [])
+            signal_types = [s.signal_type for s in signals] if signals else ['unknown']
+            light_conditions = presence_result.get('light_conditions', 'unknown')
 
-            # Log how many samples we have now
-            sample_count = self.owner_profile.sample_count
-            if sample_count >= 3:
-                logger.info(f"Owner profile trained with {sample_count} samples")
+            # Check owner identification
+            owner_confidence = presence_result.get('owner_match_confidence')
+            departure_actor = presence_result.get('departure_actor')
+            pattern_match = presence_result.get('pattern_match')
+
+            # Determine alert urgency based on owner match and pattern
+            if owner_confidence is not None:
+                if owner_confidence >= 0.8:
+                    urgency = "LOW"
+                    owner_status = f"Likely you ({owner_confidence:.0%})"
+                elif owner_confidence >= 0.6:
+                    urgency = "MEDIUM"
+                    owner_status = f"Possibly you ({owner_confidence:.0%})"
+                else:
+                    urgency = "HIGH"
+                    owner_status = f"Unknown ({owner_confidence:.0%})"
             else:
-                logger.info(f"Owner profile has {sample_count}/3 samples needed for recognition")
+                urgency = "MEDIUM"
+                if departure_actor:
+                    owner_status = "Person detected, not trained"
+                else:
+                    owner_status = "No person identified"
+
+            # Pattern info
+            pattern_status = None
+            if pattern_match:
+                # Pattern reduces urgency
+                if urgency == "HIGH":
+                    urgency = "MEDIUM"
+                day = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][pattern_match.day_of_week]
+                start = pattern_match.time_window_start.strftime('%H:%M')
+                end = pattern_match.time_window_end.strftime('%H:%M')
+                pattern_status = f"Matches {day} {start}-{end} ({pattern_match.occurrence_count}x)"
+
+            # Format message based on urgency
+            if urgency == "HIGH":
+                header = "ALERT: Unknown person departing!"
+            elif urgency == "LOW":
+                header = "Car departure detected"
+            else:
+                header = "Car departure detected"
+
+            # Build message
+            lines = [header, ""]
+            lines.append(f"Signals: {', '.join(signal_types)}")
+            lines.append(f"Light: {light_conditions}")
+            lines.append(f"Driver: {owner_status}")
+
+            if pattern_status:
+                lines.append(f"Pattern: {pattern_status}")
+
+            lines.append("")
+            lines.append("Reply 'me' if this was you.")
+
+            message = "\n".join(lines)
+
+            # Send via notifier
+            self.notifier.send_alert(
+                message=message,
+                image_data=frame_jpeg
+            )
+            logger.info(f"Departure alert sent (urgency: {urgency})")
+
+        except Exception as e:
+            logger.error(f"Failed to send departure alert: {e}")
+
+    def _send_return_alert(self, frame: np.ndarray, presence_result: dict):
+        """Send a return alert via Telegram."""
+        if not self.notifier:
+            return
+
+        try:
+            # Prepare snapshot
+            frame_jpeg = None
+            if frame is not None:
+                _, jpeg_data = cv2.imencode('.jpg', frame)
+                frame_jpeg = jpeg_data.tobytes()
+
+            # Build message
+            light_conditions = presence_result.get('light_conditions', 'unknown')
+            baseline_updated = presence_result.get('baseline', {}) is not None
+
+            message = (
+                f"Car has returned!\n\n"
+                f"Light conditions: {light_conditions}\n"
+                f"Baseline updated: {'Yes' if baseline_updated else 'No'}\n\n"
+                f"Reply 'me' if this was you."
+            )
+
+            # Send via notifier
+            self.notifier.send_alert(
+                message=message,
+                image_data=frame_jpeg
+            )
+            logger.info("Return alert sent")
+
+        except Exception as e:
+            logger.error(f"Failed to send return alert: {e}")
 
     def get_status(self) -> dict:
         """Get current pipeline status."""
         uptime = None
         if self.stats["start_time"]:
             uptime = (datetime.now() - self.stats["start_time"]).total_seconds()
-        
+
+        # Get presence tracking status
+        presence_status = None
+        if self.presence_tracker:
+            presence_status = self.presence_tracker.get_status()
+
         return {
             "state": self.current_state,
             "running": self._running,
             "car_in_frame": self.car_detector.car_in_frame,
             "recording": self.recorder.is_recording if hasattr(self.recorder, 'is_recording') else False,
             "stats": self.stats,
-            "uptime_seconds": uptime
+            "uptime_seconds": uptime,
+            "presence_tracking": presence_status
         }
