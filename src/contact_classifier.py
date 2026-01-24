@@ -48,7 +48,19 @@ class TrackedPerson:
     hand_positions: List[Tuple[int, int]]  # Last N hand positions
 
 
-@dataclass 
+@dataclass
+class TrackedVehicle:
+    """A vehicle being tracked near the car."""
+    track_id: int
+    bbox: Tuple[int, int, int, int]
+    bbox_history: List[Tuple[int, int, int, int]]  # Last N bboxes for motion detection
+    frames_tracked: int
+    frames_overlapping: int  # Consecutive frames with overlap
+    last_alert_timestamp: float  # For cooldown
+    is_stationary: bool  # True if vehicle hasn't moved significantly
+
+
+@dataclass
 class ContactEvent:
     """A detected contact event."""
     contact_type: ContactType
@@ -81,12 +93,21 @@ class ContactClassifier:
         self.contact_confidence = detection_config.get("contact_confidence", 0.7)
         self.dwell_time = detection_config.get("contact_dwell_time", 1.5)
         self.proximity_buffer = config.get("zones", {}).get("proximity_buffer", 50)
-        
+
+        # Vehicle contact settings (to reduce false positives from parked cars)
+        vehicle_config = detection_config.get("vehicle_contact", {})
+        self.vehicle_overlap_threshold = vehicle_config.get("overlap_threshold", 0.20)  # 20% overlap required
+        self.vehicle_persistence_frames = vehicle_config.get("persistence_frames", 5)  # Must overlap for 5 frames
+        self.vehicle_cooldown_seconds = vehicle_config.get("cooldown_seconds", 60.0)  # 60s between alerts for same vehicle
+        self.vehicle_stationary_threshold = vehicle_config.get("stationary_threshold", 15)  # Pixels of movement to be "moving"
+        self.vehicle_stationary_frames = vehicle_config.get("stationary_frames", 30)  # Frames to determine if stationary
+
         # Tracking state
         self.tracked_persons: dict[int, TrackedPerson] = {}
+        self.tracked_vehicles: dict[int, TrackedVehicle] = {}  # Track other vehicles
         self.active_contacts: List[ContactEvent] = []
         self.contact_history = deque(maxlen=100)
-        
+
         # Motion analysis
         self.prev_frame = None
         self.motion_threshold = 25  # Pixel difference threshold for motion
@@ -365,12 +386,24 @@ class ContactClassifier:
         car_bbox: tuple,
         timestamp: float
     ) -> Optional[ContactEvent]:
-        """Check if another vehicle is contacting the target car."""
+        """
+        Check if another vehicle is contacting the target car.
+
+        Filters out false positives from:
+        - Stationary parked vehicles nearby
+        - Brief/flickering detections
+        - Repeated alerts for the same vehicle
+        """
+        current_vehicle_ids = set()
+
         for det in detections:
             if det.get('class') not in ['car', 'truck', 'motorcycle', 'bicycle']:
                 continue
 
             other_bbox = det['bbox']
+            track_id = det.get('track_id', id(det))  # Use object id if no track_id
+            current_vehicle_ids.add(track_id)
+
             overlap = self._calculate_overlap(other_bbox, car_bbox)
 
             # Skip self-detections: if overlap is very high (>85%), this is likely
@@ -379,16 +412,141 @@ class ContactClassifier:
                 logger.debug(f"Ignoring vehicle detection with {overlap:.0%} overlap (likely self-detection)")
                 continue
 
-            if overlap > 0.05:  # Partial overlap indicates actual contact
+            # Update or create tracked vehicle
+            if track_id in self.tracked_vehicles:
+                vehicle = self.tracked_vehicles[track_id]
+                vehicle.bbox = other_bbox
+                vehicle.bbox_history.append(other_bbox)
+                # Keep only last N frames of history
+                vehicle.bbox_history = vehicle.bbox_history[-self.vehicle_stationary_frames:]
+                vehicle.frames_tracked += 1
+
+                # Update overlap tracking
+                if overlap > self.vehicle_overlap_threshold:
+                    vehicle.frames_overlapping += 1
+                else:
+                    vehicle.frames_overlapping = 0
+
+                # Check if vehicle is stationary (hasn't moved significantly)
+                vehicle.is_stationary = self._is_vehicle_stationary(vehicle)
+            else:
+                # New vehicle detected
+                self.tracked_vehicles[track_id] = TrackedVehicle(
+                    track_id=track_id,
+                    bbox=other_bbox,
+                    bbox_history=[other_bbox],
+                    frames_tracked=1,
+                    frames_overlapping=1 if overlap > self.vehicle_overlap_threshold else 0,
+                    last_alert_timestamp=0.0,
+                    is_stationary=False  # Can't determine yet
+                )
+                continue  # Need more frames to evaluate
+
+            vehicle = self.tracked_vehicles[track_id]
+
+            # Check all conditions for a valid vehicle contact alert
+            if self._should_alert_vehicle_contact(vehicle, overlap, timestamp):
+                # Update cooldown timestamp
+                vehicle.last_alert_timestamp = timestamp
+                # Reset overlap counter to prevent rapid re-alerts
+                vehicle.frames_overlapping = 0
+
+                logger.info(
+                    f"Vehicle contact detected: track_id={track_id}, "
+                    f"overlap={overlap:.1%}, stationary={vehicle.is_stationary}, "
+                    f"frames_overlapping={vehicle.frames_tracked}"
+                )
+
                 return ContactEvent(
                     contact_type=ContactType.VEHICLE_CONTACT,
-                    confidence=min(overlap * 5, 1.0),  # Scale confidence by overlap
+                    confidence=min(overlap * 2, 1.0),  # More conservative confidence scaling
                     location=self._get_overlap_center(other_bbox, car_bbox),
-                    actor_id=det.get('track_id'),
+                    actor_id=track_id,
                     timestamp=timestamp
                 )
 
+        # Clean up vehicles that are no longer detected
+        for track_id in list(self.tracked_vehicles.keys()):
+            if track_id not in current_vehicle_ids:
+                del self.tracked_vehicles[track_id]
+
         return None
+
+    def _is_vehicle_stationary(self, vehicle: TrackedVehicle) -> bool:
+        """
+        Determine if a vehicle is stationary based on bbox movement history.
+
+        A vehicle is considered stationary if its bounding box center hasn't
+        moved more than the threshold over the tracking period.
+        """
+        if len(vehicle.bbox_history) < self.vehicle_stationary_frames // 2:
+            # Not enough history to determine - assume moving (safer)
+            return False
+
+        # Calculate center positions from bbox history
+        centers = []
+        for bbox in vehicle.bbox_history:
+            cx = (bbox[0] + bbox[2]) / 2
+            cy = (bbox[1] + bbox[3]) / 2
+            centers.append((cx, cy))
+
+        # Check max movement from first position
+        first_center = centers[0]
+        max_movement = 0.0
+        for center in centers[1:]:
+            movement = np.sqrt(
+                (center[0] - first_center[0]) ** 2 +
+                (center[1] - first_center[1]) ** 2
+            )
+            max_movement = max(max_movement, movement)
+
+        return max_movement < self.vehicle_stationary_threshold
+
+    def _should_alert_vehicle_contact(
+        self,
+        vehicle: TrackedVehicle,
+        overlap: float,
+        timestamp: float
+    ) -> bool:
+        """
+        Determine if we should generate an alert for this vehicle contact.
+
+        Requires ALL of:
+        1. Sufficient overlap (above threshold)
+        2. Persistent overlap (for multiple frames)
+        3. Vehicle is NOT stationary (it's actively moving/approaching)
+        4. Cooldown period has passed since last alert for this vehicle
+        """
+        # 1. Check overlap threshold
+        if overlap <= self.vehicle_overlap_threshold:
+            return False
+
+        # 2. Check persistence (must overlap for multiple consecutive frames)
+        if vehicle.frames_overlapping < self.vehicle_persistence_frames:
+            logger.debug(
+                f"Vehicle {vehicle.track_id}: overlap persistent for "
+                f"{vehicle.frames_overlapping}/{self.vehicle_persistence_frames} frames"
+            )
+            return False
+
+        # 3. Check if vehicle is stationary (parked cars don't trigger alerts)
+        if vehicle.is_stationary:
+            logger.debug(
+                f"Vehicle {vehicle.track_id}: ignoring stationary vehicle "
+                f"(likely parked car)"
+            )
+            return False
+
+        # 4. Check cooldown
+        time_since_last_alert = timestamp - vehicle.last_alert_timestamp
+        if time_since_last_alert < self.vehicle_cooldown_seconds:
+            logger.debug(
+                f"Vehicle {vehicle.track_id}: cooldown active "
+                f"({time_since_last_alert:.1f}s < {self.vehicle_cooldown_seconds}s)"
+            )
+            return False
+
+        return True
     
     def _check_impact_event(
         self,
