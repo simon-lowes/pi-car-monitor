@@ -12,8 +12,10 @@ Uses a combination of:
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple, List
 import numpy as np
+import yaml
 
 from plate_handler import PlateHandler
 from utils.hailo_utils import postprocess_yolov8_detections
@@ -87,7 +89,12 @@ class CarDetector:
         self.last_detection: Optional[CarDetection] = None
         self.consecutive_detections = 0
         self.detection_stable = False
-        
+
+        # Load baseline position for position-based fallback
+        self.baseline_bbox = None
+        self.baseline_tolerance = 100  # pixels
+        self._load_baseline(config)
+
         # Load models
         self._load_models()
     
@@ -104,7 +111,87 @@ class CarDetector:
         # self.detector_model = self.hailo.load_model(model_path)
         
         logger.info("Detection models loaded")
-    
+
+    def _load_baseline(self, config: dict):
+        """Load baseline car position from file for position-based detection."""
+        baseline_path = config.get("presence_tracking", {}).get(
+            "baseline_path", "data/car_baseline.yaml"
+        )
+        try:
+            path = Path(baseline_path)
+            if path.exists():
+                with open(path) as f:
+                    data = yaml.safe_load(f)
+                if data and "baseline" in data:
+                    bbox = data["baseline"].get("bbox", {})
+                    if all(k in bbox for k in ["x1", "y1", "x2", "y2"]):
+                        self.baseline_bbox = (
+                            bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"]
+                        )
+                        self.baseline_tolerance = data["baseline"].get(
+                            "position_tolerance", 100
+                        )
+                        logger.info(f"Loaded baseline position: {self.baseline_bbox} "
+                                   f"(tolerance: {self.baseline_tolerance}px)")
+                    else:
+                        logger.warning("Baseline file missing bbox coordinates")
+            else:
+                logger.info("No baseline file found - position fallback disabled")
+        except Exception as e:
+            logger.warning(f"Failed to load baseline: {e}")
+
+    def _matches_baseline_position(self, bbox: Tuple[int, int, int, int]) -> float:
+        """
+        Check if a detection matches the baseline position.
+
+        Returns a confidence score (0.0 to 1.0) based on position match.
+        """
+        if self.baseline_bbox is None:
+            return 0.0
+
+        bx1, by1, bx2, by2 = bbox
+        baseline_x1, baseline_y1, baseline_x2, baseline_y2 = self.baseline_bbox
+
+        # Calculate centers
+        det_cx = (bx1 + bx2) / 2
+        det_cy = (by1 + by2) / 2
+        base_cx = (baseline_x1 + baseline_x2) / 2
+        base_cy = (baseline_y1 + baseline_y2) / 2
+
+        # Distance between centers
+        distance = ((det_cx - base_cx) ** 2 + (det_cy - base_cy) ** 2) ** 0.5
+
+        # Calculate IoU for additional confidence
+        inter_x1 = max(bx1, baseline_x1)
+        inter_y1 = max(by1, baseline_y1)
+        inter_x2 = min(bx2, baseline_x2)
+        inter_y2 = min(by2, baseline_y2)
+
+        if inter_x2 > inter_x1 and inter_y2 > inter_y1:
+            intersection = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+            area1 = (bx2 - bx1) * (by2 - by1)
+            area2 = (baseline_x2 - baseline_x1) * (baseline_y2 - baseline_y1)
+            union = area1 + area2 - intersection
+            iou = intersection / union if union > 0 else 0
+        else:
+            iou = 0.0
+
+        # Score based on distance and IoU
+        # If distance is within tolerance, give high score
+        if distance <= self.baseline_tolerance:
+            distance_score = 1.0 - (distance / self.baseline_tolerance) * 0.3
+        else:
+            distance_score = max(0, 0.7 - (distance - self.baseline_tolerance) / 200)
+
+        # Combine distance and IoU scores
+        position_score = distance_score * 0.6 + iou * 0.4
+
+        if position_score > 0.5:
+            logger.debug(f"Position match: distance={distance:.0f}px, iou={iou:.2f}, "
+                        f"score={position_score:.2f}")
+
+        return position_score
+
     def detect(self, frame: np.ndarray) -> Optional[CarDetection]:
         """
         Process a frame and detect if the target car is present.
@@ -253,7 +340,13 @@ class CarDetector:
         if model_score >= self.model_threshold:
             match_reasons.append(f"model_match:{model_score:.2f}")
         logger.debug(f"Model score: {model_score:.2f} (threshold: {self.model_threshold})")
-        
+
+        # 4. Position-based matching (uses baseline parking position)
+        position_score = self._matches_baseline_position(bbox)
+        if position_score >= 0.6:
+            match_reasons.append(f"position_match:{position_score:.2f}")
+        logger.debug(f"Position score: {position_score:.2f}")
+
         # Determine if this is the target car
         is_target = False
         final_confidence = confidence
@@ -268,6 +361,13 @@ class CarDetector:
             # Very high single-factor match
             is_target = True
             final_confidence = max(colour_score, model_score)
+        elif position_score >= 0.6:
+            # Position-based fallback: vehicle detected in baseline parking spot
+            # This is reliable when car parks in a consistent location
+            is_target = True
+            final_confidence = position_score * 0.95
+            match_reasons.append("position_fallback")
+            logger.info(f"Position fallback: vehicle at baseline position (score={position_score:.2f})")
         elif colour_score >= self.colour_threshold and self.zone_enabled:
             # Fallback: colour match + in designated zone = likely target car
             # This allows detection when plate/model matching unavailable

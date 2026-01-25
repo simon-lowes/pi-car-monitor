@@ -444,17 +444,23 @@ class TelegramNotifier:
         """Background loop polling for messages."""
         logger.debug("Listener loop started")
 
+        # Create a dedicated event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
         while self._listener_running:
             try:
-                self._check_for_replies()
+                self._check_for_replies_sync(loop)
             except Exception as e:
                 logger.error(f"Listener error: {e}")
 
             # Poll every 5 seconds
             time.sleep(5)
 
-    def _check_for_replies(self):
-        """Check for new messages and handle 'me' replies."""
+        loop.close()
+
+    def _check_for_replies_sync(self, loop):
+        """Check for new messages using provided event loop."""
         bot = self._get_bot()
         if bot is None:
             return
@@ -468,11 +474,11 @@ class TelegramNotifier:
                 )
                 return updates
             except Exception as e:
-                logger.debug(f"Failed to get updates: {e}")
+                logger.warning(f"Failed to get updates: {e}")
                 return []
 
         try:
-            updates = self._run_async(_get_updates())
+            updates = loop.run_until_complete(_get_updates())
 
             for update in updates:
                 self._last_update_id = update.update_id
@@ -486,15 +492,25 @@ class TelegramNotifier:
 
                 text = (update.message.text or "").strip().lower()
 
-                # Check for "me" or variations
+                # Check for "me" or variations (owner confirmation)
                 if text in ['me', 'mine', 'owner', "that's me", "thats me", "it's me", "its me"]:
                     logger.info("Received owner confirmation reply")
-                    self._handle_owner_reply(update.message)
+                    self._handle_owner_reply(update.message, loop)
+
+                # Check for "null" or variations (false positive)
+                elif text in ['null', 'false', 'no', 'not me', 'notme', 'wrong', 'fp', 'false positive']:
+                    logger.info("Received false positive reply")
+                    self._handle_false_positive_reply(update.message, loop)
 
         except Exception as e:
-            logger.debug(f"Error checking replies: {e}")
+            logger.error(f"Error checking replies: {e}")
 
-    def _handle_owner_reply(self, message):
+    def _check_for_replies(self):
+        """Legacy method - use _check_for_replies_sync instead."""
+        # Keep for backwards compatibility but log warning
+        logger.warning("_check_for_replies called without event loop - replies may not work")
+
+    def _handle_owner_reply(self, message, loop=None):
         """Handle a 'me' reply from the owner."""
         # Try to get event_id from replied-to message
         event_id = 0
@@ -517,7 +533,10 @@ class TelegramNotifier:
                 except Exception as e:
                     logger.error(f"Failed to send confirmation: {e}")
 
-        self._run_async(_reply())
+        if loop:
+            loop.run_until_complete(_reply())
+        else:
+            self._run_async(_reply())
 
         # Trigger callback
         if self._owner_callback:
@@ -525,6 +544,42 @@ class TelegramNotifier:
                 self._owner_callback(event_id)
             except Exception as e:
                 logger.error(f"Owner callback failed: {e}")
+
+    def _handle_false_positive_reply(self, message, loop=None):
+        """Handle a 'null/false' reply for false positive feedback."""
+        event_id = 0
+
+        if message.reply_to_message and message.reply_to_message.caption:
+            caption = message.reply_to_message.caption
+            # Could parse event ID from caption
+
+        # Send confirmation
+        async def _reply():
+            bot = self._get_bot()
+            if bot:
+                try:
+                    await bot.send_message(
+                        chat_id=self.chat_id,
+                        text="Noted as false positive. Will improve detection."
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send FP confirmation: {e}")
+
+        if loop:
+            loop.run_until_complete(_reply())
+        else:
+            self._run_async(_reply())
+
+        # Trigger false positive callback if set
+        if hasattr(self, '_false_positive_callback') and self._false_positive_callback:
+            try:
+                self._false_positive_callback(event_id)
+            except Exception as e:
+                logger.error(f"False positive callback failed: {e}")
+
+    def set_false_positive_callback(self, callback):
+        """Set callback for false positive reports."""
+        self._false_positive_callback = callback
 
 
 def create_notifier_from_config(config: dict) -> Optional[TelegramNotifier]:
