@@ -555,6 +555,9 @@ class ContactClassifier:
         timestamp: float
     ) -> Optional[ContactEvent]:
         """Detect sudden motion/impact near the car."""
+        if cv2 is None:
+            return None  # cv2 not available
+
         if self.prev_frame is None:
             return None
         
@@ -626,20 +629,21 @@ class ContactClassifier:
         return np.sqrt(h_gap**2 + v_gap**2)
     
     def _calculate_overlap(self, bbox1: tuple, bbox2: tuple) -> float:
-        """Calculate IoU-style overlap ratio."""
+        """Calculate true IoU (Intersection over Union) overlap ratio."""
         x1 = max(bbox1[0], bbox2[0])
         y1 = max(bbox1[1], bbox2[1])
         x2 = min(bbox1[2], bbox2[2])
         y2 = min(bbox1[3], bbox2[3])
-        
+
         if x2 <= x1 or y2 <= y1:
             return 0.0
-        
+
         intersection = (x2 - x1) * (y2 - y1)
         area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
         area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
-        
-        return intersection / min(area1, area2)
+        union = area1 + area2 - intersection
+
+        return intersection / union if union > 0 else 0.0
     
     def _get_overlap_center(self, bbox1: tuple, bbox2: tuple) -> Tuple[int, int]:
         """Get center point of overlapping region."""

@@ -8,6 +8,7 @@ Uses GStreamer with Hailo plugins for efficient video processing.
 """
 
 import logging
+import signal
 import threading
 import time
 from datetime import datetime
@@ -189,9 +190,12 @@ class CarMonitorPipeline:
         # Start database session
         self._session_id = self.database.start_session()
 
-        # Start Telegram reply listener for owner recognition
-        if self.notifier and self.owner_profile:
-            self.notifier.start_listener(self._on_owner_confirmed)
+        # Start Telegram reply listener for owner recognition AND false positives
+        if self.notifier:
+            owner_cb = self._on_owner_confirmed if self.owner_profile else None
+            # Always start listener - even without owner profile, we need FP feedback
+            self.notifier.start_listener(owner_cb or (lambda eid: None))
+            self.notifier.set_false_positive_callback(self._on_false_positive_reported)
 
         logger.info("Pipeline started")
     
@@ -293,6 +297,8 @@ class CarMonitorPipeline:
                 
                 # Stage 1: Car Detection
                 car_detection = self.car_detector.detect(frame)
+                if car_detection and car_detection.is_target_car:
+                    self._last_car_detection = car_detection
 
                 # Early person/pose detection for departure tracking
                 # Run this before presence tracking so we can identify who's getting in the car
@@ -335,6 +341,11 @@ class CarMonitorPipeline:
                 # Stage 0 (runs after detection): Presence Tracking
                 presence_result = None
                 if self.presence_tracking_enabled and self.presence_tracker:
+                    # Pass match reasons so presence tracker knows HOW the car was identified
+                    match_reasons = None
+                    if car_detection and car_detection.is_target_car:
+                        match_reasons = car_detection.match_reasons
+
                     presence_result = self.presence_tracker.process_frame(
                         frame=frame,
                         car_detected=self.car_detector.car_in_frame,
@@ -342,8 +353,14 @@ class CarMonitorPipeline:
                         car_confidence=car_detection.confidence if car_detection else 0.0,
                         car_stable=self.car_detector.detection_stable,
                         person_detections=early_person_detections,
-                        pose_detections=early_pose_detections
+                        pose_detections=early_pose_detections,
+                        car_match_reasons=match_reasons
                     )
+
+                    # Sync car_detector baseline if presence_tracker updated it
+                    if self.presence_tracker.baseline_updated:
+                        self.car_detector.reload_baseline()
+                        self.presence_tracker.baseline_updated = False
 
                     # Handle presence state changes
                     if presence_result.get('state_changed'):
@@ -424,6 +441,20 @@ class CarMonitorPipeline:
                 self.stats["car_detections"] += 1
                 self.current_state = "car_detected"
 
+                # Only proceed with contact detection if we have a positively
+                # identified car (not just position fallback), OR if it's dark
+                # and we're relying on baseline position
+                car_id_quality = "unknown"
+                if car_detection and car_detection.match_reasons:
+                    reason_names = {r.split(':')[0] for r in car_detection.match_reasons}
+                    if reason_names & {'plate_match', 'colour_match', 'model_match',
+                                      'model_position_match', 'colour_position_match'}:
+                        car_id_quality = "positive"
+                    elif 'position_fallback' in reason_names:
+                        car_id_quality = "position_only"
+                    else:
+                        car_id_quality = "weak"
+
                 # Stage 2: Proximity tracking
                 nearby_objects = self.proximity_tracker.process_frame(
                     frame,
@@ -462,7 +493,17 @@ class CarMonitorPipeline:
                 )
                 
                 if contacts:
-                    self._handle_contact_events(contacts, timestamp)
+                    # Suppress ALL contact alerts when car ID is weak
+                    # (prevents alerts from neighboring cars being touched)
+                    if car_id_quality == "position_only" or car_id_quality == "weak":
+                        logger.info(
+                            f"Suppressing {len(contacts)} contact alert(s): car ID quality "
+                            f"is '{car_id_quality}' (likely contact with neighboring car, not ours)"
+                        )
+                        contacts = []  # Suppress all contacts when car ID is unreliable
+
+                    if contacts:
+                        self._handle_contact_events(contacts, timestamp)
                 else:
                     # No contact - if we were recording, check if we should stop
                     if self.recorder.is_recording:
@@ -517,9 +558,21 @@ class CarMonitorPipeline:
                 if self.recorder.is_recording and hasattr(self.recorder, '_current_recording_path'):
                     recording_path = str(self.recorder._current_recording_path)
 
+                # Extract appearance features from the person who made contact
+                person_features = None
+                if self._last_frame is not None and contact.actor_id is not None:
+                    # Try to get person bbox from nearby objects or pose detections
+                    person_bbox = self._get_person_bbox_for_contact(contact)
+                    if person_bbox:
+                        from owner_profile import extract_person_features
+                        person_features = extract_person_features(self._last_frame, person_bbox)
+                        if person_features is not None:
+                            logger.debug(f"Extracted appearance features for contact event")
+
                 event_id = self.owner_profile.create_event(
                     recording_path=recording_path,
-                    timestamp=timestamp
+                    timestamp=timestamp,
+                    features=person_features
                 )
 
             # Start recording if not already
@@ -551,10 +604,16 @@ class CarMonitorPipeline:
                         _, jpeg_data = cv2.imencode('.jpg', self._last_frame)
                         frame_jpeg = jpeg_data.tobytes()
 
+                    # Include car ID info in alert
+                    id_reasons = []
+                    if hasattr(self, '_last_car_detection') and self._last_car_detection:
+                        id_reasons = self._last_car_detection.match_reasons
+
                     self.notifier.send_recording_start(
                         contact_type=contact.contact_type.value,
                         confidence=contact.confidence,
-                        frame_data=frame_jpeg
+                        frame_data=frame_jpeg,
+                        car_id_reasons=id_reasons
                     )
 
             # Log to database
@@ -617,6 +676,85 @@ class CarMonitorPipeline:
                 light_conditions=light_conditions
             )
             logger.info("Departure recorded for pattern learning")
+
+    def _on_false_positive_reported(self, event_id: int):
+        """
+        Callback when user replies 'null'/'false' to an alert.
+
+        Records the detection as a false positive so the system learns
+        to suppress similar detections in future.
+        """
+        logger.info(f"False positive reported (event_id={event_id})")
+
+        # Record the false positive zone in the car detector
+        # This teaches the system where NOT to look
+        last_bbox = self.car_detector.car_bbox
+        self.car_detector.record_false_positive(last_bbox)
+
+        # If we have an event in owner profile, mark it as not-owner
+        if self.owner_profile:
+            event = None
+            if event_id and event_id > 0:
+                event = self.owner_profile.get_event(event_id)
+            else:
+                event = self.owner_profile.get_latest_event()
+
+            if event:
+                event['confirmed_owner'] = False
+                event['false_positive'] = True
+                logger.info(f"Event {event.get('id', '?')} marked as false positive")
+
+        # Log to database for analysis
+        self.database.log_contact_event(
+            event_type='false_positive_reported',
+            confidence=0.0,
+            location=(0, 0),
+            actor_type='user_feedback',
+            actor_track_id=None,
+            duration=0.0,
+            recording_path=None,
+            metadata={
+                'event_id': event_id,
+                'session_id': self._session_id,
+                'fp_zones_count': len(self.car_detector._false_positive_zones)
+            }
+        )
+
+    def _get_person_bbox_for_contact(self, contact) -> Optional[tuple]:
+        """
+        Get the bounding box of the person who made contact.
+
+        Searches through tracked nearby objects to find one matching the contact's actor_id.
+
+        Returns:
+            (x1, y1, x2, y2) tuple or None if not found
+        """
+        try:
+            # Check if proximity tracker has the nearby object
+            if hasattr(self, 'proximity_tracker') and self.proximity_tracker:
+                nearby = getattr(self.proximity_tracker, 'nearby_objects', [])
+                for obj in nearby:
+                    if hasattr(obj, 'track_id') and obj.track_id == contact.actor_id:
+                        if hasattr(obj, 'bbox') and obj.bbox:
+                            return tuple(obj.bbox)
+
+            # Fallback: try to find person from pose detections
+            if hasattr(self, '_last_pose_detections') and self._last_pose_detections:
+                for pose in self._last_pose_detections:
+                    if hasattr(pose, 'bbox') and pose.bbox:
+                        return tuple(pose.bbox)
+
+            # Last resort: use contact location to estimate a person region
+            if contact.location:
+                lx, ly = contact.location
+                # Estimate a person-sized bbox around the contact point
+                # Typical person is ~50-100 pixels wide, 100-200 tall at this distance
+                return (int(lx - 50), int(ly - 150), int(lx + 50), int(ly + 50))
+
+        except Exception as e:
+            logger.warning(f"Failed to get person bbox: {e}")
+
+        return None
 
     def _check_owner_at_departure(self, presence_result: dict) -> Optional[float]:
         """
@@ -805,3 +943,69 @@ class CarMonitorPipeline:
             "uptime_seconds": uptime,
             "presence_tracking": presence_status
         }
+
+    def save_debug_snapshot(self):
+        """
+        Save a debug snapshot with detection boxes overlaid.
+
+        Can be triggered via SIGUSR1: kill -USR1 <pid>
+        """
+        if self._last_frame is None:
+            logger.warning("No frame available for debug snapshot")
+            return None
+
+        try:
+            frame = self._last_frame.copy()
+
+            # Draw baseline box (yellow)
+            if self.presence_tracker and self.presence_tracker.baseline:
+                baseline = self.presence_tracker.baseline
+                x1, y1, x2, y2 = baseline['bbox']['x1'], baseline['bbox']['y1'], baseline['bbox']['x2'], baseline['bbox']['y2']
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                cv2.putText(frame, "baseline", (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+            # Draw current detection (green if target car, red otherwise)
+            if hasattr(self, '_last_car_detection') and self._last_car_detection:
+                det = self._last_car_detection
+                x1, y1, x2, y2 = det.bbox
+                color = (0, 255, 0) if det.is_target_car else (0, 0, 255)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 4)
+
+                # Label
+                if det.is_target_car:
+                    label = f"YOUR CAR {det.confidence:.0%}"
+                    cv2.rectangle(frame, (x1, y1 - 35), (x1 + 250, y1), color, -1)
+                    cv2.putText(frame, label, (x1 + 5, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
+
+                    # Match reasons
+                    reasons = ", ".join(det.match_reasons[:3])  # Limit to 3
+                    cv2.putText(frame, reasons, (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+            # Add timestamp and status
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cv2.putText(frame, ts, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            status = f"State: {self.current_state} | Car: {'YES' if self.car_detector.car_in_frame else 'NO'}"
+            cv2.putText(frame, status, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            # Save
+            debug_dir = Path("data/debug")
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            output_path = debug_dir / f"live_detection_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            cv2.imwrite(str(output_path), frame)
+
+            logger.info(f"Debug snapshot saved: {output_path}")
+            return str(output_path)
+
+        except Exception as e:
+            logger.error(f"Failed to save debug snapshot: {e}")
+            return None
+
+    def _setup_signal_handlers(self):
+        """Set up signal handlers for debug features."""
+        def sigusr1_handler(signum, frame):
+            logger.info("SIGUSR1 received - saving debug snapshot")
+            self.save_debug_snapshot()
+
+        signal.signal(signal.SIGUSR1, sigusr1_handler)
+        logger.info("Signal handlers configured (SIGUSR1 = save debug snapshot)")

@@ -18,6 +18,87 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
+
+def extract_person_features(frame: np.ndarray, person_bbox: tuple) -> Optional[np.ndarray]:
+    """
+    Extract appearance features from a person in the frame.
+
+    Uses color histograms and simple texture descriptors to create
+    a feature vector that can be compared via cosine similarity.
+
+    Args:
+        frame: The full frame (BGR image)
+        person_bbox: (x1, y1, x2, y2) bounding box of the person
+
+    Returns:
+        Normalized feature vector (np.ndarray) or None if extraction fails
+    """
+    if not CV2_AVAILABLE or frame is None:
+        return None
+
+    try:
+        x1, y1, x2, y2 = [int(v) for v in person_bbox]
+        h, w = frame.shape[:2]
+
+        # Clamp to frame bounds
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        # Extract person crop
+        person_crop = frame[y1:y2, x1:x2]
+
+        if person_crop.size == 0:
+            return None
+
+        # Resize to standard size for consistent features
+        standard_size = (64, 128)  # width, height
+        resized = cv2.resize(person_crop, standard_size)
+
+        # Convert to HSV for color features
+        hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
+
+        # Extract histograms
+        h_hist = cv2.calcHist([hsv], [0], None, [16], [0, 180])  # Hue: 16 bins
+        s_hist = cv2.calcHist([hsv], [1], None, [8], [0, 256])   # Sat: 8 bins
+        v_hist = cv2.calcHist([hsv], [2], None, [8], [0, 256])   # Val: 8 bins
+
+        # Extract grayscale texture features (simple gradients)
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+
+        # Gradient magnitude histogram
+        magnitude = np.sqrt(sobelx**2 + sobely**2)
+        mag_hist, _ = np.histogram(magnitude.flatten(), bins=16, range=(0, 255))
+
+        # Combine all features
+        features = np.concatenate([
+            h_hist.flatten(),      # 16 values
+            s_hist.flatten(),      # 8 values
+            v_hist.flatten(),      # 8 values
+            mag_hist.astype(float) # 16 values
+        ])  # Total: 48 features
+
+        # Normalize to unit vector
+        norm = np.linalg.norm(features)
+        if norm > 0:
+            features = features / norm
+
+        return features.astype(np.float32)
+
+    except Exception as e:
+        logger.warning(f"Feature extraction failed: {e}")
+        return None
+
 
 class OwnerProfile:
     """

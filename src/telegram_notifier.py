@@ -363,7 +363,8 @@ class TelegramNotifier:
         self,
         contact_type: str,
         confidence: float,
-        frame_data: Optional[bytes] = None
+        frame_data: Optional[bytes] = None,
+        car_id_reasons: Optional[List[str]] = None
     ) -> bool:
         """
         Send notification when recording starts.
@@ -372,17 +373,27 @@ class TelegramNotifier:
             contact_type: Type of contact detected (e.g., "HAND_TOUCH")
             confidence: Detection confidence (0-1)
             frame_data: Optional JPEG image data of the frame
+            car_id_reasons: How the car was identified (e.g. plate_match, colour_match)
 
         Returns:
             True if sent successfully
         """
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Format car identification info
+        id_info = "Unknown"
+        if car_id_reasons:
+            reason_names = [r.split(':')[0] for r in car_id_reasons]
+            id_info = ', '.join(reason_names)
+
         message = (
             f"Contact detected on your car!\n\n"
             f"Type: {contact_type}\n"
             f"Confidence: {confidence:.0%}\n"
+            f"Car ID: {id_info}\n"
             f"Time: {timestamp}\n\n"
-            f"Recording started..."
+            f"Recording started...\n\n"
+            f"Reply 'null' if this is wrong (teaches the system)."
         )
 
         return self.send_alert(message, image_data=frame_data)
@@ -498,7 +509,10 @@ class TelegramNotifier:
                     self._handle_owner_reply(update.message, loop)
 
                 # Check for "null" or variations (false positive)
-                elif text in ['null', 'false', 'no', 'not me', 'notme', 'wrong', 'fp', 'false positive']:
+                elif text in ['null', 'false', 'no', 'not me', 'notme', 'wrong', 'fp',
+                              'false positive', 'nope', 'not mine', 'other car',
+                              'neighbour', 'neighbor', 'next car', 'wrong car',
+                              'not my car', 'different car', 'ignore']:
                     logger.info("Received false positive reply")
                     self._handle_false_positive_reply(update.message, loop)
 
@@ -560,7 +574,12 @@ class TelegramNotifier:
                 try:
                     await bot.send_message(
                         chat_id=self.chat_id,
-                        text="Noted as false positive. Will improve detection."
+                        text=(
+                            "False positive recorded. "
+                            "The detection zone has been logged and will be "
+                            "suppressed in future. The more you report, "
+                            "the better the filtering becomes."
+                        )
                     )
                 except Exception as e:
                     logger.error(f"Failed to send FP confirmation: {e}")

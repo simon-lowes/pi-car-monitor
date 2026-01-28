@@ -17,6 +17,11 @@ from typing import Optional, Tuple, List
 import numpy as np
 import yaml
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 from plate_handler import PlateHandler
 from utils.hailo_utils import postprocess_yolov8_detections
 
@@ -93,7 +98,19 @@ class CarDetector:
         # Load baseline position for position-based fallback
         self.baseline_bbox = None
         self.baseline_tolerance = 100  # pixels
+
+        # Baseline image crops for model matching
+        self._baseline_crops = []
+
+        # False positive tracking
+        self._false_positive_zones = []  # List of bbox regions that are NOT the car
+        self._fp_data_path = Path(config.get("presence_tracking", {}).get(
+            "baseline_path", "data/car_baseline.yaml"
+        )).parent / "false_positives.yaml"
+
         self._load_baseline(config)
+        self._load_baseline_images(config)
+        self._load_false_positives()
 
         # Load models
         self._load_models()
@@ -139,6 +156,187 @@ class CarDetector:
                 logger.info("No baseline file found - position fallback disabled")
         except Exception as e:
             logger.warning(f"Failed to load baseline: {e}")
+
+    def reload_baseline(self):
+        """
+        Reload baseline from disk.
+
+        Call this when presence_tracker updates the baseline so that
+        car_detector uses the current position for matching.
+        """
+        self._load_baseline(self.config)
+        self._load_baseline_images(self.config)
+        logger.info("Baseline reloaded from disk")
+
+    def _load_baseline_images(self, config: dict):
+        """Load baseline snapshot images and precompute features for model matching."""
+        if cv2 is None:
+            return
+
+        baseline_dir = Path(config.get("presence_tracking", {}).get(
+            "baseline_path", "data/car_baseline.yaml"
+        )).parent / "baselines"
+
+        if not baseline_dir.exists():
+            logger.info("No baseline images directory found")
+            return
+
+        target_size = (128, 64)  # width, height - must match _match_model
+
+        for img_path in sorted(baseline_dir.glob("baseline_*.jpg")):
+            try:
+                img = cv2.imread(str(img_path))
+                if img is None:
+                    continue
+
+                # Extract the car region from the baseline image using known bbox
+                if self.baseline_bbox:
+                    x1, y1, x2, y2 = self.baseline_bbox
+                    # Clamp to image bounds
+                    h, w = img.shape[:2]
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(w, x2), min(h, y2)
+                    if x2 > x1 and y2 > y1:
+                        car_crop = img[y1:y2, x1:x2]
+                    else:
+                        continue
+                else:
+                    # Use center region as approximation
+                    h, w = img.shape[:2]
+                    car_crop = img[h // 4:3 * h // 4, w // 4:3 * w // 4]
+
+                crop_resized = cv2.resize(car_crop, target_size)
+                crop_hsv = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2HSV)
+                crop_gray = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2GRAY)
+
+                h_hist = cv2.calcHist([crop_hsv], [0], None, [50], [0, 180])
+                s_hist = cv2.calcHist([crop_hsv], [1], None, [60], [0, 256])
+                v_hist = cv2.calcHist([crop_hsv], [2], None, [60], [0, 256])
+                cv2.normalize(h_hist, h_hist)
+                cv2.normalize(s_hist, s_hist)
+                cv2.normalize(v_hist, v_hist)
+
+                self._baseline_crops.append({
+                    'path': str(img_path),
+                    'h_hist': h_hist,
+                    's_hist': s_hist,
+                    'v_hist': v_hist,
+                    'gray': crop_gray,
+                })
+
+            except Exception as e:
+                logger.warning(f"Failed to load baseline image {img_path}: {e}")
+
+        logger.info(f"Loaded {len(self._baseline_crops)} baseline image(s) for model matching")
+
+    def _load_false_positives(self):
+        """Load learned false positive zones."""
+        try:
+            if self._fp_data_path.exists():
+                with open(self._fp_data_path) as f:
+                    data = yaml.safe_load(f)
+                if data and 'false_positive_zones' in data:
+                    self._false_positive_zones = data['false_positive_zones']
+                    logger.info(f"Loaded {len(self._false_positive_zones)} false positive zone(s)")
+        except Exception as e:
+            logger.warning(f"Failed to load false positives: {e}")
+
+    def _save_false_positives(self):
+        """Save learned false positive zones to disk."""
+        try:
+            self._fp_data_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                'false_positive_zones': self._false_positive_zones,
+                'count': len(self._false_positive_zones)
+            }
+            with open(self._fp_data_path, 'w') as f:
+                yaml.dump(data, f, default_flow_style=False)
+            logger.debug(f"Saved {len(self._false_positive_zones)} false positive zone(s)")
+        except Exception as e:
+            logger.warning(f"Failed to save false positives: {e}")
+
+    def record_false_positive(self, bbox: Optional[Tuple[int, int, int, int]] = None):
+        """
+        Record a false positive detection. Called when user replies 'null'.
+
+        Stores the bbox region so future detections in that area are penalised.
+        """
+        if bbox is None:
+            bbox = self.car_bbox
+        if bbox is None:
+            logger.debug("No bbox to record as false positive")
+            return
+
+        cx = (bbox[0] + bbox[2]) // 2
+        cy = (bbox[1] + bbox[3]) // 2
+        area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+
+        fp_entry = {
+            'center': [cx, cy],
+            'area': area,
+            'bbox': list(bbox),
+            'count': 1
+        }
+
+        # Check if this overlaps an existing FP zone (merge if so)
+        merged = False
+        for existing in self._false_positive_zones:
+            ex_cx, ex_cy = existing['center']
+            dist = ((cx - ex_cx) ** 2 + (cy - ex_cy) ** 2) ** 0.5
+            if dist < 80:  # Within 80px = same zone
+                existing['count'] = existing.get('count', 1) + 1
+                # Update center as running average
+                n = existing['count']
+                existing['center'] = [
+                    int((ex_cx * (n - 1) + cx) / n),
+                    int((ex_cy * (n - 1) + cy) / n),
+                ]
+                merged = True
+                logger.info(f"False positive zone updated (count={existing['count']}, "
+                           f"center={existing['center']})")
+                break
+
+        if not merged:
+            self._false_positive_zones.append(fp_entry)
+            logger.info(f"New false positive zone recorded at ({cx}, {cy})")
+
+        # Keep max 20 zones
+        if len(self._false_positive_zones) > 20:
+            self._false_positive_zones.sort(key=lambda z: z.get('count', 1))
+            self._false_positive_zones = self._false_positive_zones[-20:]
+
+        self._save_false_positives()
+
+    def _is_in_false_positive_zone(self, bbox: Tuple[int, int, int, int]) -> bool:
+        """Check if a detection bbox falls in a known false positive zone."""
+        if not self._false_positive_zones:
+            return False
+
+        cx = (bbox[0] + bbox[2]) // 2
+        cy = (bbox[1] + bbox[3]) // 2
+
+        for fp_zone in self._false_positive_zones:
+            fp_cx, fp_cy = fp_zone['center']
+            dist = ((cx - fp_cx) ** 2 + (cy - fp_cy) ** 2) ** 0.5
+            fp_count = fp_zone.get('count', 1)
+
+            # More confirmed FPs = larger exclusion radius
+            exclusion_radius = min(40 + fp_count * 10, 120)
+
+            if dist < exclusion_radius:
+                # Also check it's NOT at our baseline position
+                if self.baseline_bbox:
+                    bx = (self.baseline_bbox[0] + self.baseline_bbox[2]) // 2
+                    by = (self.baseline_bbox[1] + self.baseline_bbox[3]) // 2
+                    dist_to_baseline = ((cx - bx) ** 2 + (cy - by) ** 2) ** 0.5
+                    if dist_to_baseline < 30:
+                        # This is at our car's position, don't suppress
+                        continue
+                logger.debug(f"Detection at ({cx},{cy}) in FP zone "
+                           f"(dist={dist:.0f}, count={fp_count})")
+                return True
+
+        return False
 
     def _matches_baseline_position(self, bbox: Tuple[int, int, int, int]) -> float:
         """
@@ -229,53 +427,102 @@ class CarDetector:
     
     def _detect_vehicles(self, frame: np.ndarray) -> List[Tuple[tuple, float]]:
         """
-        Run vehicle detection model.
+        Run vehicle detection model using tiled detection.
+
+        Uses overlapping tiles to detect smaller vehicles that would be
+        missed when the full frame is resized to 640x640.
 
         Returns:
             List of (bbox, confidence) tuples for detected vehicles
         """
-        # Run inference
         model_name = "detector"
         if "car_detector" in self.hailo.models:
             model_name = "car_detector"
 
-        outputs = self.hailo.run_inference(model_name, frame)
+        frame_h, frame_w = frame.shape[:2]
+        conf_threshold = self.config.get("detection", {}).get("proximity_confidence", 0.5)
+        vehicle_classes = {'car', 'truck', 'bus', 'motorcycle'}
+        all_vehicles = []
 
+        # Use tiled detection for wide frames (like 1920x1080)
+        # This prevents small cars from being missed during resize
+        if frame_w > 1200:
+            # Tile 1: Left portion (0 to 60% width)
+            tile1_end = int(frame_w * 0.6)
+            tile1 = frame[:, 0:tile1_end]
+            vehicles1 = self._detect_on_tile(tile1, model_name, conf_threshold, vehicle_classes, x_offset=0)
+            all_vehicles.extend(vehicles1)
+
+            # Tile 2: Right portion (40% to 100% width) - overlaps with tile 1
+            tile2_start = int(frame_w * 0.4)
+            tile2 = frame[:, tile2_start:]
+            vehicles2 = self._detect_on_tile(tile2, model_name, conf_threshold, vehicle_classes, x_offset=tile2_start)
+            all_vehicles.extend(vehicles2)
+
+            # Remove duplicates via simple NMS
+            all_vehicles = self._nms_vehicles(all_vehicles, iou_threshold=0.5)
+        else:
+            # Small frame - run on full frame
+            all_vehicles = self._detect_on_tile(frame, model_name, conf_threshold, vehicle_classes, x_offset=0)
+
+        return all_vehicles
+
+    def _detect_on_tile(self, tile: np.ndarray, model_name: str, conf_threshold: float,
+                        vehicle_classes: set, x_offset: int) -> List[Tuple[tuple, float]]:
+        """Run detection on a single tile and adjust coordinates."""
+        outputs = self.hailo.run_inference(model_name, tile)
         if outputs is None:
-            logger.warning("Hailo inference returned None")
             return []
 
-        # Log output structure for debugging
-        for key, val in outputs.items():
-            if isinstance(val, list):
-                logger.debug(f"Output '{key}': list with {len(val)} items")
-                if val and isinstance(val[0], list):
-                    logger.debug(f"  First item has {len(val[0])} class arrays")
-            elif hasattr(val, 'shape'):
-                logger.debug(f"Output '{key}': array shape {val.shape}")
-
-        # Postprocess detections
-        frame_h, frame_w = frame.shape[:2]
+        tile_h, tile_w = tile.shape[:2]
         detections = postprocess_yolov8_detections(
             outputs,
-            conf_threshold=self.config.get("detection", {}).get("proximity_confidence", 0.5),
-            orig_shape=(frame_h, frame_w)
+            conf_threshold=conf_threshold,
+            orig_shape=(tile_h, tile_w)
         )
 
-        # Log all detections before filtering
-        if detections:
-            det_summary = [(d['class'], round(d['confidence'], 2)) for d in detections]
-            logger.debug(f"Raw detections: {det_summary}")
-
-        # Filter to vehicle classes only
-        vehicle_classes = {'car', 'truck', 'bus', 'motorcycle'}
         vehicles = []
-
         for det in detections:
             if det['class'] in vehicle_classes:
-                vehicles.append((det['bbox'], det['confidence']))
+                x1, y1, x2, y2 = det['bbox']
+                # Adjust x coordinates for tile offset
+                adjusted_bbox = (x1 + x_offset, y1, x2 + x_offset, y2)
+                vehicles.append((adjusted_bbox, det['confidence']))
 
         return vehicles
+
+    def _nms_vehicles(self, vehicles: List[Tuple[tuple, float]], iou_threshold: float) -> List[Tuple[tuple, float]]:
+        """Apply non-maximum suppression to remove duplicate detections."""
+        if not vehicles:
+            return []
+
+        # Sort by confidence (highest first)
+        vehicles = sorted(vehicles, key=lambda x: x[1], reverse=True)
+        keep = []
+
+        while vehicles:
+            best = vehicles.pop(0)
+            keep.append(best)
+            vehicles = [v for v in vehicles if self._iou(best[0], v[0]) < iou_threshold]
+
+        return keep
+
+    def _iou(self, box1: tuple, box2: tuple) -> float:
+        """Calculate IoU between two boxes."""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        intersection = (x2 - x1) * (y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - intersection
+
+        return intersection / union if union > 0 else 0.0
     
     def _filter_to_zone(self, vehicles: list, frame_w: int, frame_h: int) -> list:
         """Filter detections to only those within the configured zone."""
@@ -347,34 +594,50 @@ class CarDetector:
             match_reasons.append(f"position_match:{position_score:.2f}")
         logger.debug(f"Position score: {position_score:.2f}")
 
+        # Reject if in a known false positive zone (unless plate verified)
+        if not plate_verified and self._is_in_false_positive_zone(bbox):
+            logger.debug(f"Rejecting detection in false positive zone")
+            return CarDetection(
+                bbox=bbox,
+                confidence=confidence,
+                is_target_car=False,
+                match_reasons=["rejected_fp_zone"],
+                plate_verified=False
+            )
+
         # Determine if this is the target car
+        # Requires MULTIPLE corroborating signals, not just one weak match
         is_target = False
         final_confidence = confidence
 
         if plate_verified:
+            # Plate is definitive
             is_target = True
             final_confidence = 1.0
         elif colour_score >= self.colour_threshold and model_score >= self.model_threshold:
+            # Both colour AND model match = strong identification
             is_target = True
             final_confidence = (colour_score + model_score) / 2
-        elif colour_score >= 0.9 or model_score >= 0.9:
-            # Very high single-factor match
+        elif model_score >= 0.85 and position_score >= 0.7:
+            # Strong model match at known position
             is_target = True
-            final_confidence = max(colour_score, model_score)
-        elif position_score >= 0.6:
-            # Position-based fallback: vehicle detected in baseline parking spot
-            # This is reliable when car parks in a consistent location
+            final_confidence = (model_score * 0.6 + position_score * 0.4)
+            match_reasons.append("model_position_match")
+        elif colour_score >= self.colour_threshold and position_score >= 0.7:
+            # Colour match at known position (requires tighter position)
             is_target = True
-            final_confidence = position_score * 0.95
+            final_confidence = (colour_score * 0.5 + position_score * 0.5) * 0.9
+            match_reasons.append("colour_position_match")
+        elif position_score >= 0.85 and colour_score >= 0.5:
+            # Very tight position match with at least plausible colour
+            # This handles cases where baseline is well-established
+            is_target = True
+            final_confidence = position_score * 0.9
             match_reasons.append("position_fallback")
-            logger.info(f"Position fallback: vehicle at baseline position (score={position_score:.2f})")
-        elif colour_score >= self.colour_threshold and self.zone_enabled:
-            # Fallback: colour match + in designated zone = likely target car
-            # This allows detection when plate/model matching unavailable
-            is_target = True
-            final_confidence = colour_score * 0.9  # Slightly lower confidence
-            match_reasons.append("zone_fallback")
-            logger.debug(f"Zone fallback triggered: colour {colour_score:.2f} in zone")
+            logger.info(f"Position fallback: vehicle at baseline position "
+                       f"(pos={position_score:.2f}, colour={colour_score:.2f})")
+        # Removed: lone colour match in zone is too weak
+        # Removed: lone position >= 0.6 is too weak
 
         if is_target:
             logger.info(f"Target car detected! Confidence: {final_confidence:.2f}, reasons: {match_reasons}")
@@ -437,13 +700,14 @@ class CarDetector:
             # Handle achromatic colours (white, black, silver, grey)
             if target_colour in ['white', 'silver', 'grey', 'gray']:
                 # Low saturation indicates achromatic
-                # Use higher threshold (60) to tolerate reflections from environment
-                if detected_sat < 60:
-                    if target_colour == 'white' and detected_val > 180:
+                # Use higher threshold (70) to tolerate reflections from environment
+                if detected_sat < 70:
+                    if target_colour == 'white' and detected_val > 170:
                         return 0.9
-                    elif target_colour in ['silver', 'grey', 'gray'] and 80 < detected_val < 180:
+                    elif target_colour in ['silver', 'grey', 'gray'] and 50 < detected_val < 200:
+                        # Wider range (50-200) to handle varying lighting conditions
                         return 0.85
-                    elif target_colour == 'black' and detected_val < 60:
+                    elif target_colour == 'black' and detected_val < 70:
                         return 0.9
                 return 0.3
 
@@ -469,16 +733,68 @@ class CarDetector:
     
     def _match_model(self, vehicle_crop: np.ndarray) -> float:
         """
-        Match vehicle shape/model using fine-tuned classifier.
-        
-        If no custom model is available, returns 0.0 (not used).
+        Match vehicle appearance against stored baseline images.
+
+        Uses histogram comparison and structural similarity to determine
+        if the detected vehicle looks like the owner's car. Compares against
+        the baseline snapshots captured at different lighting conditions.
+
+        Returns a confidence score (0.0 to 1.0).
         """
-        # TODO: Run model classifier if available
-        # This would use a model trained on images of the specific
-        # make/model to identify it
-        
-        # Placeholder
-        return 0.0
+        if cv2 is None or vehicle_crop.size == 0:
+            return 0.0
+
+        if not self._baseline_crops:
+            return 0.0
+
+        try:
+            # Resize crop to standard size for comparison
+            target_size = (128, 64)  # width, height
+            crop_resized = cv2.resize(vehicle_crop, target_size)
+            crop_hsv = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2HSV)
+            crop_gray = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2GRAY)
+
+            # Compute histograms for the candidate vehicle
+            h_hist = cv2.calcHist([crop_hsv], [0], None, [50], [0, 180])
+            s_hist = cv2.calcHist([crop_hsv], [1], None, [60], [0, 256])
+            v_hist = cv2.calcHist([crop_hsv], [2], None, [60], [0, 256])
+            cv2.normalize(h_hist, h_hist)
+            cv2.normalize(s_hist, s_hist)
+            cv2.normalize(v_hist, v_hist)
+
+            best_score = 0.0
+
+            for baseline_data in self._baseline_crops:
+                b_h_hist = baseline_data['h_hist']
+                b_s_hist = baseline_data['s_hist']
+                b_v_hist = baseline_data['v_hist']
+                b_gray = baseline_data['gray']
+
+                # Histogram correlation (hue, saturation, value)
+                h_corr = cv2.compareHist(h_hist, b_h_hist, cv2.HISTCMP_CORREL)
+                s_corr = cv2.compareHist(s_hist, b_s_hist, cv2.HISTCMP_CORREL)
+                v_corr = cv2.compareHist(v_hist, b_v_hist, cv2.HISTCMP_CORREL)
+
+                # Structural similarity via normalized cross-correlation
+                ncc = cv2.matchTemplate(crop_gray, b_gray, cv2.TM_CCORR_NORMED)
+                struct_score = float(ncc[0][0]) if ncc.size > 0 else 0.0
+
+                # Weight: hue matters most for car colour, structure for shape
+                hist_score = (h_corr * 0.4 + s_corr * 0.2 + v_corr * 0.2)
+                combined = hist_score * 0.5 + struct_score * 0.5
+
+                # Clamp to 0-1
+                combined = max(0.0, min(1.0, combined))
+                best_score = max(best_score, combined)
+
+            if best_score > 0.4:
+                logger.debug(f"Model match score: {best_score:.2f}")
+
+            return best_score
+
+        except Exception as e:
+            logger.warning(f"Model matching error: {e}")
+            return 0.0
     
     def _update_state(self, detection: Optional[CarDetection]):
         """Update detection state for stability tracking."""

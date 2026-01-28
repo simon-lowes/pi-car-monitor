@@ -136,6 +136,7 @@ class PresenceTracker:
         self.state = PresenceState.UNKNOWN
         self.baseline: Optional[CarBaseline] = None
         self.previous_baseline: Optional[CarBaseline] = None
+        self.baseline_updated = False  # Flag for pipeline to check and trigger car_detector reload
 
         # Counters for state stability
         self.frames_in_state = 0
@@ -217,6 +218,7 @@ class PresenceTracker:
             with open(self.baseline_path, 'w') as f:
                 yaml.dump(data, f, default_flow_style=False)
 
+            self.baseline_updated = True  # Signal car_detector to reload
             logger.debug(f"Baseline saved to {self.baseline_path}")
 
         except Exception as e:
@@ -505,7 +507,8 @@ class PresenceTracker:
         car_confidence: float,
         car_stable: bool,
         person_detections: Optional[List[Dict]] = None,
-        pose_detections: Optional[List[Dict]] = None
+        pose_detections: Optional[List[Dict]] = None,
+        car_match_reasons: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
         Process a frame and update presence state.
@@ -520,6 +523,7 @@ class PresenceTracker:
             car_stable: Whether detection is stable (3+ consecutive frames)
             person_detections: Optional list of person detections with 'bbox'
             pose_detections: Optional list of pose detections with 'bbox' and 'keypoints'
+            car_match_reasons: List of reasons the car was identified (e.g. plate_match, colour_match)
 
         Returns:
             Dict with:
@@ -534,6 +538,22 @@ class PresenceTracker:
         self.frames_in_state += 1
         timestamp = time.time()
 
+        # Track whether the car was positively identified (not just position fallback)
+        self._car_positively_identified = False
+        if car_detected and car_match_reasons:
+            strong_reasons = {'plate_match', 'colour_match', 'model_match',
+                            'model_position_match', 'colour_position_match'}
+            reason_names = {r.split(':')[0] for r in car_match_reasons}
+            self._car_positively_identified = bool(reason_names & strong_reasons)
+
+        # Track how many frames the car has been positively identified
+        if self._car_positively_identified:
+            self._frames_positively_identified = getattr(
+                self, '_frames_positively_identified', 0) + 1
+        else:
+            self._frames_positively_identified = max(
+                0, getattr(self, '_frames_positively_identified', 0) - 1)
+
         result = {
             'state': self.state,
             'state_changed': False,
@@ -543,7 +563,8 @@ class PresenceTracker:
             'alert_reason': None,
             'light_conditions': self._detect_light_conditions(frame),
             'departure_actor': None,
-            'owner_match_confidence': None
+            'owner_match_confidence': None,
+            'car_positively_identified': self._car_positively_identified
         }
 
         # Track actors during PRESENT and DEPARTING states if we have person detections
@@ -751,15 +772,39 @@ class PresenceTracker:
             self.frames_departure_signals += 1
             result['departure_signals'] = departure_signals
 
+            # In daylight, require that the car was positively identified recently
+            # before accepting departure signals. This prevents neighbor car
+            # activity from triggering false departure alerts.
+            can_depart = True
+            if light_conditions == 'daylight':
+                frames_pos_id = getattr(self, '_frames_positively_identified', 0)
+                if frames_pos_id < 3:
+                    # Car hasn't been positively identified recently in daylight.
+                    # Only lights/motion signals — likely a neighboring vehicle.
+                    signal_types = [s.signal_type for s in departure_signals]
+                    has_missing = 'car_missing' in signal_types
+                    has_position_shift = 'position_shift' in signal_types
+
+                    if not has_missing and not has_position_shift:
+                        # Only light/motion signals without car being identified = skip
+                        can_depart = False
+                        logger.debug(
+                            "Suppressing departure signals in daylight: "
+                            "car not positively identified "
+                            f"(frames_identified={frames_pos_id})"
+                        )
+
             # Require confirmation frames before transitioning
-            if self.frames_departure_signals >= self.departure_confirmation_frames:
+            if can_depart and self.frames_departure_signals >= self.departure_confirmation_frames:
                 self.departure_started_at = time.time()
                 self._transition_state(
                     PresenceState.DEPARTING,
                     'departure_signals_detected',
                     {
                         'signals': [s.signal_type for s in self.departure_signals[-5:]],
-                        'light_conditions': light_conditions
+                        'light_conditions': light_conditions,
+                        'car_positively_identified': getattr(
+                            self, '_car_positively_identified', False)
                     }
                 )
                 result['state'] = self.state

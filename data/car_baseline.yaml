@@ -1,0 +1,37 @@
+baseline:
+  area: 25752
+  area_tolerance_pct: 0.15
+  bbox:
+    x1: 719
+    x2: 867
+    y1: 603
+    y2: 777
+  center:
+  - 793
+  - 690
+  confidence: 0.8697635876802463
+  established_at: '2026-01-28T13:26:19.324514'
+  established_at_unix: 1769606779.3245142
+  frame_height: 1080
+  frame_width: 1920
+  light_conditions: twilight
+  position_tolerance: 50
+history:
+- area: 25230
+  area_tolerance_pct: 0.15
+  bbox:
+    x1: 719
+    x2: 864
+    y1: 603
+    y2: 777
+  center:
+  - 791
+  - 690
+  confidence: 0.8665107034986778
+  established_at: '2026-01-28T13:25:29.447682'
+  established_at_unix: 1769606729.4476824
+  frame_height: 1080
+  frame_width: 1920
+  light_conditions: twilight
+  position_tolerance: 50
+last_updated: '2026-01-28T13:26:19.345357'

@@ -1,0 +1,22 @@
+count: 2
+false_positive_zones:
+- area: 26215
+  bbox:
+  - 1196
+  - 361
+  - 1441
+  - 468
+  center:
+  - 1317
+  - 414
+  count: 4
+- area: 26224
+  bbox:
+  - 718
+  - 602
+  - 867
+  - 778
+  center:
+  - 791
+  - 690
+  count: 2
