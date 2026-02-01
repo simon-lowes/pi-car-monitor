@@ -131,6 +131,7 @@ class PresenceTracker:
         self.departure_confirmation_frames = self.config.get('departure_confirmation_frames', 5)
         self.absence_confirmation_frames = self.config.get('absence_confirmation_frames', 30)
         self.return_stability_frames = self.config.get('return_stability_frames', 10)
+        self.departing_timeout_seconds = self.config.get('departing_timeout_seconds', 180)
 
         # State
         self.state = PresenceState.UNKNOWN
@@ -849,6 +850,34 @@ class PresenceTracker:
                     return result
 
         self.frames_car_detected = 0
+
+        # Timeout: if car has been continuously detected for too long in
+        # DEPARTING state, it clearly didn't leave. Transition back to PRESENT.
+        if (car_detected and self.departure_started_at and
+                time.time() - self.departure_started_at > self.departing_timeout_seconds):
+            elapsed = time.time() - self.departure_started_at
+            logger.info(
+                f"DEPARTING timeout after {elapsed:.0f}s — car still detected, "
+                f"reverting to PRESENT"
+            )
+
+            # Update baseline if we have a good detection in daylight
+            if car_bbox and light_conditions != 'night':
+                self.establish_baseline(frame, car_bbox, car_confidence)
+
+            self._transition_state(
+                PresenceState.PRESENT,
+                'departing_timeout',
+                {
+                    'elapsed_seconds': elapsed,
+                    'light_conditions': light_conditions
+                }
+            )
+            result['state'] = self.state
+            result['state_changed'] = True
+            self.departure_signals = []
+            self.departure_started_at = None
+            return result
 
         # Check if car is now absent
         if not car_detected:

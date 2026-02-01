@@ -681,15 +681,25 @@ class CarMonitorPipeline:
         """
         Callback when user replies 'null'/'false' to an alert.
 
-        Records the detection as a false positive so the system learns
-        to suppress similar detections in future.
+        Routes feedback to the appropriate subsystem:
+        - Vehicle contact FPs → contact_classifier (transit zone learning)
+        - Car detection FPs → car_detector (FP zone learning)
         """
         logger.info(f"False positive reported (event_id={event_id})")
 
-        # Record the false positive zone in the car detector
-        # This teaches the system where NOT to look
-        last_bbox = self.car_detector.car_bbox
-        self.car_detector.record_false_positive(last_bbox)
+        fp_detail = "zone_recorded"
+
+        # Check if this was a vehicle contact false positive
+        last_vehicle_info = self.contact_classifier.last_vehicle_contact_info
+        if last_vehicle_info and (time.time() - last_vehicle_info.get('timestamp', 0)) < 300:
+            # This FP was likely about a vehicle contact alert (within 5 min)
+            fp_detail = self.contact_classifier.record_vehicle_false_positive()
+            logger.info(f"Vehicle contact FP recorded: {fp_detail}")
+        else:
+            # Not a vehicle contact — record as car detection FP zone
+            last_bbox = self.car_detector.car_bbox
+            self.car_detector.record_false_positive(last_bbox)
+            logger.info("Car detection FP zone recorded")
 
         # If we have an event in owner profile, mark it as not-owner
         if self.owner_profile:
@@ -716,9 +726,14 @@ class CarMonitorPipeline:
             metadata={
                 'event_id': event_id,
                 'session_id': self._session_id,
-                'fp_zones_count': len(self.car_detector._false_positive_zones)
+                'fp_detail': fp_detail,
+                'fp_zones_count': len(self.car_detector._false_positive_zones),
+                'transit_zones_count': len(self.contact_classifier._transit_zones),
             }
         )
+
+        # Return detail for Telegram response
+        return fp_detail
 
     def _get_person_bbox_for_contact(self, contact) -> Optional[tuple]:
         """

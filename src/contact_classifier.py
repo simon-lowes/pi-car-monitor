@@ -19,8 +19,10 @@ The goal is to distinguish between:
 import logging
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Optional, List, Tuple
 import numpy as np
+import yaml
 from collections import deque
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,7 @@ class TrackedVehicle:
     frames_overlapping: int  # Consecutive frames with overlap
     last_alert_timestamp: float  # For cooldown
     is_stationary: bool  # True if vehicle hasn't moved significantly
+    is_passing: bool = False  # True if vehicle is moving laterally (driving past)
 
 
 @dataclass
@@ -100,7 +103,20 @@ class ContactClassifier:
         self.vehicle_persistence_frames = vehicle_config.get("persistence_frames", 5)  # Must overlap for 5 frames
         self.vehicle_cooldown_seconds = vehicle_config.get("cooldown_seconds", 60.0)  # 60s between alerts for same vehicle
         self.vehicle_stationary_threshold = vehicle_config.get("stationary_threshold", 15)  # Pixels of movement to be "moving"
-        self.vehicle_stationary_frames = vehicle_config.get("stationary_frames", 30)  # Frames to determine if stationary
+        self.vehicle_stationary_frames = vehicle_config.get("stationary_frames", 30)  # Frames to track for stationary detection
+        self.vehicle_passing_speed_threshold = vehicle_config.get("passing_speed_threshold", 8)  # Pixels/frame lateral speed = passing
+        self.vehicle_size_ratio_min = vehicle_config.get("size_ratio_min", 0.3)  # Other vehicle must be >= 30% of car area
+        self.vehicle_size_ratio_max = vehicle_config.get("size_ratio_max", 3.0)  # Other vehicle must be <= 300% of car area
+
+        # Transit zone learning — regions where vehicles regularly pass without contact
+        self._transit_zones: List[dict] = []  # Learned from "null" feedback
+        self._transit_zones_path = Path(config.get("presence_tracking", {}).get(
+            "baseline_path", "data/car_baseline.yaml"
+        )).parent / "transit_zones.yaml"
+        self._load_transit_zones()
+
+        # Track the last vehicle contact event details for FP feedback
+        self.last_vehicle_contact_info: Optional[dict] = None
 
         # Tracking state
         self.tracked_persons: dict[int, TrackedPerson] = {}
@@ -445,7 +461,7 @@ class ContactClassifier:
             vehicle = self.tracked_vehicles[track_id]
 
             # Check all conditions for a valid vehicle contact alert
-            if self._should_alert_vehicle_contact(vehicle, overlap, timestamp):
+            if self._should_alert_vehicle_contact(vehicle, overlap, timestamp, car_bbox):
                 # Update cooldown timestamp
                 vehicle.last_alert_timestamp = timestamp
                 # Reset overlap counter to prevent rapid re-alerts
@@ -454,8 +470,17 @@ class ContactClassifier:
                 logger.info(
                     f"Vehicle contact detected: track_id={track_id}, "
                     f"overlap={overlap:.1%}, stationary={vehicle.is_stationary}, "
-                    f"frames_overlapping={vehicle.frames_tracked}"
+                    f"passing={vehicle.is_passing}, frames_overlapping={vehicle.frames_tracked}"
                 )
+
+                # Store info for potential FP feedback
+                self.last_vehicle_contact_info = {
+                    'other_vehicle_bbox': tuple(other_bbox),
+                    'car_bbox': tuple(car_bbox),
+                    'overlap': overlap,
+                    'track_id': track_id,
+                    'timestamp': timestamp,
+                }
 
                 return ContactEvent(
                     contact_type=ContactType.VEHICLE_CONTACT,
@@ -502,11 +527,232 @@ class ContactClassifier:
 
         return max_movement < self.vehicle_stationary_threshold
 
+    def _is_vehicle_passing(self, vehicle: TrackedVehicle) -> bool:
+        """
+        Determine if a vehicle is passing through (driving past) based on
+        consistent lateral (horizontal) motion.
+
+        A passing vehicle has:
+        - Consistent horizontal movement across frames
+        - Relatively little vertical movement (not approaching/departing in depth)
+        - Speed above the passing threshold
+        """
+        if len(vehicle.bbox_history) < 4:
+            return False
+
+        centers = []
+        for bbox in vehicle.bbox_history[-min(15, len(vehicle.bbox_history)):]:
+            cx = (bbox[0] + bbox[2]) / 2
+            cy = (bbox[1] + bbox[3]) / 2
+            centers.append((cx, cy))
+
+        if len(centers) < 4:
+            return False
+
+        # Calculate per-frame horizontal and vertical deltas
+        h_deltas = []
+        v_deltas = []
+        for i in range(1, len(centers)):
+            h_deltas.append(centers[i][0] - centers[i - 1][0])
+            v_deltas.append(centers[i][1] - centers[i - 1][1])
+
+        if not h_deltas:
+            return False
+
+        avg_h_speed = abs(np.mean(h_deltas))
+        avg_v_speed = abs(np.mean(v_deltas))
+
+        # Check consistency of horizontal direction (all same sign = consistent direction)
+        h_signs = [1 if d > 0.5 else (-1 if d < -0.5 else 0) for d in h_deltas]
+        non_zero_signs = [s for s in h_signs if s != 0]
+        if not non_zero_signs:
+            return False
+
+        # Direction consistency: fraction of frames moving in the dominant direction
+        dominant_dir = 1 if sum(non_zero_signs) > 0 else -1
+        consistency = sum(1 for s in non_zero_signs if s == dominant_dir) / len(non_zero_signs)
+
+        # A passing vehicle moves consistently in one horizontal direction,
+        # with much more horizontal than vertical movement
+        is_passing = (
+            avg_h_speed >= self.vehicle_passing_speed_threshold and
+            avg_h_speed > avg_v_speed * 2.0 and  # Predominantly horizontal
+            consistency >= 0.7  # At least 70% of frames in same direction
+        )
+
+        if is_passing:
+            logger.debug(
+                f"Vehicle {vehicle.track_id}: passing (h_speed={avg_h_speed:.1f}px/f, "
+                f"v_speed={avg_v_speed:.1f}px/f, consistency={consistency:.0%})"
+            )
+
+        return is_passing
+
+    def _is_similar_depth(self, other_bbox: tuple, car_bbox: tuple) -> bool:
+        """
+        Estimate whether two objects are at similar depth based on apparent size.
+
+        Uses the principle that objects closer to the camera appear larger.
+        If the other vehicle's area is vastly different from the target car's
+        area, they're likely at different distances from the camera.
+
+        Also considers vertical position: objects lower in frame are typically
+        closer to the camera (ground-plane perspective).
+        """
+        car_area = (car_bbox[2] - car_bbox[0]) * (car_bbox[3] - car_bbox[1])
+        other_area = (other_bbox[2] - other_bbox[0]) * (other_bbox[3] - other_bbox[1])
+
+        if car_area <= 0:
+            return True  # Can't determine, allow
+
+        size_ratio = other_area / car_area
+
+        # Check if size ratio is within acceptable range
+        if size_ratio < self.vehicle_size_ratio_min or size_ratio > self.vehicle_size_ratio_max:
+            logger.debug(
+                f"Depth filter: other vehicle area ratio {size_ratio:.2f} "
+                f"outside [{self.vehicle_size_ratio_min}, {self.vehicle_size_ratio_max}] "
+                f"(other={other_area}, car={car_area})"
+            )
+            return False
+
+        # Additional heuristic: check bottom-edge position
+        # Objects at similar depth should have similar bottom-edge y-coordinates
+        # (ground plane assumption for a roughly level parking area)
+        car_bottom = car_bbox[3]
+        other_bottom = other_bbox[3]
+        bottom_diff = abs(other_bottom - car_bottom)
+
+        # If the other vehicle's bottom edge is far from the car's bottom edge,
+        # they're likely at very different depths. Allow generous tolerance
+        # because vehicles have different heights.
+        frame_height = 1080  # Reasonable default
+        max_bottom_diff = frame_height * 0.25  # 25% of frame height
+
+        if bottom_diff > max_bottom_diff:
+            logger.debug(
+                f"Depth filter: bottom edge diff {bottom_diff}px > {max_bottom_diff:.0f}px "
+                f"(car_bottom={car_bottom}, other_bottom={other_bottom})"
+            )
+            return False
+
+        return True
+
+    def _is_in_transit_zone(self, bbox: tuple) -> bool:
+        """Check if a vehicle's center falls in a learned transit zone."""
+        if not self._transit_zones:
+            return False
+
+        cx = (bbox[0] + bbox[2]) / 2
+        cy = (bbox[1] + bbox[3]) / 2
+
+        for zone in self._transit_zones:
+            zx, zy = zone['center']
+            zone_count = zone.get('count', 1)
+            # Radius grows with confidence (more reports = larger zone)
+            radius = min(60 + zone_count * 15, 200)
+
+            dist = ((cx - zx) ** 2 + (cy - zy) ** 2) ** 0.5
+            if dist < radius:
+                logger.debug(
+                    f"Vehicle at ({cx:.0f},{cy:.0f}) in transit zone "
+                    f"(center=({zx},{zy}), count={zone_count}, radius={radius})"
+                )
+                return True
+
+        return False
+
+    def _load_transit_zones(self):
+        """Load learned transit zones from disk."""
+        try:
+            if self._transit_zones_path.exists():
+                with open(self._transit_zones_path) as f:
+                    data = yaml.safe_load(f)
+                if data and 'transit_zones' in data:
+                    self._transit_zones = data['transit_zones']
+                    logger.info(f"Loaded {len(self._transit_zones)} transit zone(s)")
+        except Exception as e:
+            logger.warning(f"Failed to load transit zones: {e}")
+
+    def _save_transit_zones(self):
+        """Save learned transit zones to disk."""
+        try:
+            self._transit_zones_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                'transit_zones': self._transit_zones,
+                'count': len(self._transit_zones)
+            }
+            with open(self._transit_zones_path, 'w') as f:
+                yaml.dump(data, f, default_flow_style=False)
+            logger.debug(f"Saved {len(self._transit_zones)} transit zone(s)")
+        except Exception as e:
+            logger.warning(f"Failed to save transit zones: {e}")
+
+    def record_vehicle_false_positive(self, vehicle_bbox: Optional[tuple] = None):
+        """
+        Record a vehicle contact false positive. Called when user replies 'null'
+        to a vehicle contact alert.
+
+        Records the OTHER vehicle's position as a transit zone, teaching the
+        system that vehicles passing through that area aren't making contact.
+
+        Args:
+            vehicle_bbox: Bbox of the other vehicle that triggered the false alert.
+                         If None, uses the last recorded vehicle contact info.
+        """
+        if vehicle_bbox is None and self.last_vehicle_contact_info:
+            vehicle_bbox = self.last_vehicle_contact_info.get('other_vehicle_bbox')
+
+        if vehicle_bbox is None:
+            logger.debug("No vehicle bbox to record as transit zone")
+            return "no_data"
+
+        cx = int((vehicle_bbox[0] + vehicle_bbox[2]) / 2)
+        cy = int((vehicle_bbox[1] + vehicle_bbox[3]) / 2)
+
+        # Merge with existing zone if close
+        merged = False
+        for zone in self._transit_zones:
+            zx, zy = zone['center']
+            dist = ((cx - zx) ** 2 + (cy - zy) ** 2) ** 0.5
+            if dist < 100:  # Within 100px = same transit lane
+                zone['count'] = zone.get('count', 1) + 1
+                n = zone['count']
+                zone['center'] = [
+                    int((zx * (n - 1) + cx) / n),
+                    int((zy * (n - 1) + cy) / n),
+                ]
+                merged = True
+                logger.info(
+                    f"Transit zone updated (count={zone['count']}, "
+                    f"center={zone['center']})"
+                )
+                break
+
+        if not merged:
+            self._transit_zones.append({
+                'center': [cx, cy],
+                'bbox': list(vehicle_bbox),
+                'count': 1,
+            })
+            logger.info(f"New transit zone recorded at ({cx}, {cy})")
+
+        # Keep max 15 zones
+        if len(self._transit_zones) > 15:
+            self._transit_zones.sort(key=lambda z: z.get('count', 1))
+            self._transit_zones = self._transit_zones[-15:]
+
+        self._save_transit_zones()
+
+        zone_count = sum(z.get('count', 1) for z in self._transit_zones)
+        return f"transit_zone_recorded (total: {len(self._transit_zones)} zones, {zone_count} reports)"
+
     def _should_alert_vehicle_contact(
         self,
         vehicle: TrackedVehicle,
         overlap: float,
-        timestamp: float
+        timestamp: float,
+        car_bbox: tuple
     ) -> bool:
         """
         Determine if we should generate an alert for this vehicle contact.
@@ -515,7 +761,10 @@ class ContactClassifier:
         1. Sufficient overlap (above threshold)
         2. Persistent overlap (for multiple frames)
         3. Vehicle is NOT stationary (it's actively moving/approaching)
-        4. Cooldown period has passed since last alert for this vehicle
+        4. Vehicle is NOT passing (driving laterally through frame)
+        5. Vehicle is at similar apparent depth (size heuristic)
+        6. Vehicle is NOT in a learned transit zone
+        7. Cooldown period has passed since last alert for this vehicle
         """
         # 1. Check overlap threshold
         if overlap <= self.vehicle_overlap_threshold:
@@ -537,7 +786,31 @@ class ContactClassifier:
             )
             return False
 
-        # 4. Check cooldown
+        # 4. Check if vehicle is passing through (driving past on the road)
+        vehicle.is_passing = self._is_vehicle_passing(vehicle)
+        if vehicle.is_passing:
+            logger.info(
+                f"Vehicle {vehicle.track_id}: ignoring passing vehicle "
+                f"(consistent lateral motion detected)"
+            )
+            return False
+
+        # 5. Check depth heuristic (apparent size comparison)
+        if not self._is_similar_depth(vehicle.bbox, car_bbox):
+            logger.info(
+                f"Vehicle {vehicle.track_id}: ignoring vehicle at different depth "
+                f"(apparent size mismatch)"
+            )
+            return False
+
+        # 6. Check if vehicle center is in a learned transit zone
+        if self._is_in_transit_zone(vehicle.bbox):
+            logger.info(
+                f"Vehicle {vehicle.track_id}: ignoring vehicle in learned transit zone"
+            )
+            return False
+
+        # 7. Check cooldown
         time_since_last_alert = timestamp - vehicle.last_alert_timestamp
         if time_since_last_alert < self.vehicle_cooldown_seconds:
             logger.debug(

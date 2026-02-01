@@ -260,6 +260,8 @@ class CarDetector:
         Record a false positive detection. Called when user replies 'null'.
 
         Stores the bbox region so future detections in that area are penalised.
+        Skips recording if the FP zone overlaps the car's baseline position
+        (those zones provide no suppression value due to the baseline exception).
         """
         if bbox is None:
             bbox = self.car_bbox
@@ -270,6 +272,20 @@ class CarDetector:
         cx = (bbox[0] + bbox[2]) // 2
         cy = (bbox[1] + bbox[3]) // 2
         area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+
+        # Don't record FP zones that overlap the baseline — they're ineffective
+        # because _is_in_false_positive_zone skips detections at baseline anyway
+        if self.baseline_bbox:
+            bx = (self.baseline_bbox[0] + self.baseline_bbox[2]) // 2
+            by = (self.baseline_bbox[1] + self.baseline_bbox[3]) // 2
+            dist_to_baseline = ((cx - bx) ** 2 + (cy - by) ** 2) ** 0.5
+            if dist_to_baseline < 50:
+                logger.info(
+                    f"Skipping FP zone at ({cx},{cy}) — overlaps baseline position "
+                    f"(dist={dist_to_baseline:.0f}px). This FP is likely a vehicle "
+                    f"contact issue, not a car detection issue."
+                )
+                return
 
         fp_entry = {
             'center': [cx, cy],

@@ -204,3 +204,68 @@ The system was alerting on events from neighboring cars (especially tail lights 
 - Plate: FX71YTS (stored as SHA-256 hash only)
 - Baseline position: center (1321, 414) in 1920x1080 frame, bbox 1202-1441 x 361-467
 - Parking: appears to be upper-right quadrant of camera view
+
+### Session: 2026-01-31 — Passing Vehicle False Positive Overhaul
+
+**Problem reported by owner:**
+Vehicle contact false positives from passing traffic. When a van or car drives past on the road behind the parked car, the 2D bounding box overlap triggers a collision alert. The owner replies "null" but the system wasn't learning the right thing — it was recording the car's own detection zone as an FP, not learning that the OTHER vehicle was just passing through. The owner was unsure if feedback was making any difference.
+
+**Root cause analysis:**
+1. Contact detection used purely 2D bounding box IoU with no depth/distance estimation — a van driving past 30 feet behind the car visually overlaps in 2D
+2. No motion direction analysis — a vehicle moving laterally at road speed should not trigger a contact alert
+3. "null" feedback recorded the car detector's own bbox as an FP zone, not the other vehicle's position. Vehicle contact FPs need completely different handling from car detection FPs
+4. FP zones at the baseline position were recorded but never suppressed (by design, to avoid suppressing real detections) — wasting FP slot capacity
+5. Telegram response was generic ("zone has been logged") regardless of what type of FP occurred
+
+**Changes made:**
+
+#### `src/contact_classifier.py`
+- **Added `_is_vehicle_passing()`**: Detects vehicles with consistent lateral (horizontal) motion. Requires horizontal speed > 8px/frame, predominantly horizontal movement (>2x vertical), and >70% direction consistency. Passing vehicles are filtered out before alerts
+- **Added `_is_similar_depth()`**: Pseudo-depth filter using apparent size comparison. If the other vehicle's area is <30% or >300% of the target car's area, they're likely at different distances. Also checks bottom-edge position (ground plane perspective heuristic)
+- **Added transit zone learning**: `_load_transit_zones()`, `_save_transit_zones()`, `_is_in_transit_zone()`, `record_vehicle_false_positive()` — learns where vehicles regularly pass through. When user replies "null" to a vehicle contact alert, the OTHER vehicle's position is recorded as a transit zone. Future vehicle contacts from that region are suppressed
+- **Added `last_vehicle_contact_info`**: Stores the bbox/details of the most recent vehicle contact alert so the FP callback can record the right thing
+- **Added `is_passing` field to `TrackedVehicle`**: Tracks whether each vehicle is classified as passing through
+- **Updated `_should_alert_vehicle_contact()`**: Now checks 7 conditions (was 4): overlap threshold, persistence, not stationary, not passing, similar depth, not in transit zone, cooldown
+- **New config options**: `passing_speed_threshold`, `size_ratio_min`, `size_ratio_max` in `vehicle_contact` section
+- **New data file**: `data/transit_zones.yaml` — persisted transit zone data
+
+#### `src/pipeline.py`
+- **Rewired `_on_false_positive_reported()`**: Now checks if the last alert was a vehicle contact (within 5 min). If so, routes to `contact_classifier.record_vehicle_false_positive()` (transit zone learning). Otherwise falls through to `car_detector.record_false_positive()` (detection zone learning). Returns detail string for Telegram message
+- **Logs transit zone count** alongside FP zone count in database metadata
+
+#### `src/car_detector.py`
+- **Added baseline guard to `record_false_positive()`**: Skips recording FP zones within 50px of the car's baseline position, since those zones are ineffective (the suppression logic always skips detections at baseline) and waste FP capacity. Logs an informative message explaining why
+
+#### `src/telegram_notifier.py`
+- **Specific FP confirmation messages**: Now tells the user exactly what was learned:
+  - Vehicle contact FP: "passing vehicle recorded as transit zone. Future vehicles in that lane will be filtered out"
+  - No data available: "couldn't determine the source of the false alert"
+  - Detection FP: "detection zone logged and will be suppressed"
+- **Calls callback before sending reply**: Gets the FP detail from the pipeline callback to include in the response
+
+**Key architectural decisions:**
+- Passing vehicle detection uses motion vector analysis rather than trying to classify vehicle direction from appearance — computationally cheap and works at any time of day
+- Depth estimation uses apparent size ratio as a proxy rather than requiring stereo vision or depth sensors — simple heuristic that handles the most egregious cases (large van in foreground vs small parked car)
+- Transit zones are separate from car detection FP zones because they serve different purposes: transit zones suppress VEHICLE CONTACTS in a region, while FP zones suppress CAR DETECTION in a region
+- Bottom-edge comparison uses 25% frame height tolerance — generous enough to handle different vehicle heights while still filtering vehicles clearly in the foreground or background
+
+### Session: 2026-02-01 — DEPARTING State Stuck Bug Fix
+
+**Problem reported by owner:**
+Owner left in their car and returned during daylight, but received no departure or return alerts. The system appeared to not detect the trip at all.
+
+**Root cause analysis:**
+The presence tracker entered DEPARTING state at 09:47 AM due to departure signals (motion/lights) but:
+1. The car was still continuously detected (`car_in_frame=True`) — so the ABSENT transition (requires car missing for 30 frames) never triggered
+2. The position confidence never consistently exceeded 0.8 for 5 frames — so the back-to-PRESENT "departure cancelled" transition never triggered either
+3. **There was no timeout on the DEPARTING state** — so it stayed stuck in DEPARTING for 9+ hours
+4. When the owner actually left at ~16:10 and returned ~17:00, the system was already in DEPARTING and couldn't detect a new departure or the return cycle
+
+**Changes made:**
+
+#### `src/presence_tracker.py`
+- **Added `departing_timeout_seconds` config** (default 180s / 3 minutes): If the car is continuously detected for longer than this while in DEPARTING state, it clearly didn't leave. The system reverts to PRESENT and updates the baseline if in daylight
+- **Timeout uses wall-clock time** via `departure_started_at` timestamp — not frame counts, so it's independent of frame rate or processing load
+
+#### `config/config.yaml`
+- **Added `departing_timeout_seconds: 180`** to presence_tracking section
