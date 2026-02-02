@@ -130,6 +130,9 @@ class CarMonitorPipeline:
 
         # Store last frame for snapshot
         self._last_frame = None
+
+        # Track last contact alert for FP feedback routing
+        self._last_contact_alert_info: Optional[dict] = None
         
         # Performance settings
         perf_config = config.get("performance", {})
@@ -597,6 +600,15 @@ class CarMonitorPipeline:
                     if event and hasattr(self.recorder, '_current_recording_path'):
                         event['recording_path'] = str(self.recorder._current_recording_path)
 
+                # Track this contact for FP feedback routing
+                self._last_contact_alert_info = {
+                    'contact_type': contact.contact_type.value,
+                    'confidence': contact.confidence,
+                    'location': contact.location,
+                    'actor_id': contact.actor_id,
+                    'timestamp': timestamp,
+                }
+
                 # Send Telegram notification with snapshot
                 if self.notifier:
                     frame_jpeg = None
@@ -681,25 +693,49 @@ class CarMonitorPipeline:
         """
         Callback when user replies 'null'/'false' to an alert.
 
-        Routes feedback to the appropriate subsystem:
+        Routes feedback to the appropriate subsystem based on the last alert type:
         - Vehicle contact FPs → contact_classifier (transit zone learning)
+        - Impact FPs → logged (impact threshold already handles sensitivity)
+        - Person contact FPs → logged
+        - Departure FPs → logged (cooldown handles repeat suppression)
         - Car detection FPs → car_detector (FP zone learning)
         """
         logger.info(f"False positive reported (event_id={event_id})")
 
         fp_detail = "zone_recorded"
 
-        # Check if this was a vehicle contact false positive
-        last_vehicle_info = self.contact_classifier.last_vehicle_contact_info
-        if last_vehicle_info and (time.time() - last_vehicle_info.get('timestamp', 0)) < 300:
-            # This FP was likely about a vehicle contact alert (within 5 min)
-            fp_detail = self.contact_classifier.record_vehicle_false_positive()
-            logger.info(f"Vehicle contact FP recorded: {fp_detail}")
+        # Check what the last alert was (contact alerts take priority)
+        last_contact = self._last_contact_alert_info
+        if last_contact and (time.time() - last_contact.get('timestamp', 0)) < 300:
+            contact_type = last_contact.get('contact_type', '')
+
+            if contact_type == 'vehicle':
+                # Vehicle contact FP → transit zone learning
+                fp_detail = self.contact_classifier.record_vehicle_false_positive()
+                logger.info(f"Vehicle contact FP recorded: {fp_detail}")
+            elif contact_type == 'impact':
+                # Impact FP — can't learn a zone from motion-based detection,
+                # but log it so we know the threshold may need adjusting
+                fp_detail = "impact_fp_acknowledged"
+                logger.info(
+                    f"Impact FP acknowledged (confidence was "
+                    f"{last_contact.get('confidence', '?'):.2f})"
+                )
+            else:
+                # Person contact FP (hand_touch, body_lean, etc.)
+                fp_detail = f"{contact_type}_fp_acknowledged"
+                logger.info(f"Contact FP acknowledged: {contact_type}")
         else:
-            # Not a vehicle contact — record as car detection FP zone
-            last_bbox = self.car_detector.car_bbox
-            self.car_detector.record_false_positive(last_bbox)
-            logger.info("Car detection FP zone recorded")
+            # No recent contact alert — check vehicle contact info as fallback
+            last_vehicle_info = self.contact_classifier.last_vehicle_contact_info
+            if last_vehicle_info and (time.time() - last_vehicle_info.get('timestamp', 0)) < 300:
+                fp_detail = self.contact_classifier.record_vehicle_false_positive()
+                logger.info(f"Vehicle contact FP recorded: {fp_detail}")
+            else:
+                # Not a contact alert — record as car detection FP zone
+                last_bbox = self.car_detector.car_bbox
+                self.car_detector.record_false_positive(last_bbox)
+                logger.info("Car detection FP zone recorded")
 
         # If we have an event in owner profile, mark it as not-owner
         if self.owner_profile:

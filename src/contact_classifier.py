@@ -124,6 +124,11 @@ class ContactClassifier:
         self.active_contacts: List[ContactEvent] = []
         self.contact_history = deque(maxlen=100)
 
+        # Impact detection settings
+        impact_config = detection_config.get("impact", {})
+        self.impact_motion_ratio_threshold = impact_config.get("motion_ratio_threshold", 0.25)
+        self.impact_min_confidence = impact_config.get("min_confidence", 0.65)
+
         # Motion analysis
         self.prev_frame = None
         self.motion_threshold = 25  # Pixel difference threshold for motion
@@ -859,7 +864,17 @@ class ContactClassifier:
         motion_ratio = motion_pixels / diff_gray.size
         
         # Sudden significant motion = potential impact
-        if motion_ratio > 0.15:  # 15% of pixels changed significantly
+        if motion_ratio > self.impact_motion_ratio_threshold:
+            confidence = min(motion_ratio * 3, 1.0)
+
+            # Apply minimum confidence filter
+            if confidence < self.impact_min_confidence:
+                logger.debug(
+                    f"Impact below confidence threshold: {confidence:.2f} < "
+                    f"{self.impact_min_confidence} (motion_ratio={motion_ratio:.3f})"
+                )
+                return None
+
             # Find center of motion
             motion_mask = diff_gray > self.motion_threshold
             if np.any(motion_mask):
@@ -867,10 +882,10 @@ class ContactClassifier:
                 center = (int(np.mean(xs)) + rx1, int(np.mean(ys)) + ry1)
             else:
                 center = ((cx1 + cx2) // 2, (cy1 + cy2) // 2)
-            
+
             return ContactEvent(
                 contact_type=ContactType.IMPACT,
-                confidence=min(motion_ratio * 3, 1.0),
+                confidence=confidence,
                 location=center,
                 actor_id=None,
                 timestamp=timestamp

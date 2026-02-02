@@ -576,13 +576,24 @@ class TelegramNotifier:
                 logger.error(f"False positive callback failed: {e}")
 
         # Build specific confirmation message based on what was learned
-        if fp_detail and 'transit_zone' in str(fp_detail):
+        fp_str = str(fp_detail) if fp_detail else ""
+        if 'transit_zone' in fp_str:
             confirm_text = (
                 "Got it - passing vehicle recorded as transit zone. "
                 "Future vehicles in that lane will be filtered out. "
                 f"({fp_detail})"
             )
-        elif fp_detail and 'no_data' in str(fp_detail):
+        elif 'impact_fp' in fp_str:
+            confirm_text = (
+                "Got it - false impact alert noted. "
+                "Impact detection sensitivity has been tightened."
+            )
+        elif fp_str.endswith('_fp_acknowledged'):
+            contact_type = fp_str.replace('_fp_acknowledged', '')
+            confirm_text = (
+                f"Got it - false {contact_type} contact noted."
+            )
+        elif 'no_data' in fp_str:
             confirm_text = (
                 "Noted, but couldn't determine the source of the false alert. "
                 "The general detection zone has been penalised."

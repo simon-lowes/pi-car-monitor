@@ -148,6 +148,9 @@ class PresenceTracker:
         # Departure tracking
         self.departure_started_at: Optional[float] = None
         self.departure_signals: List[DepartureSignal] = []
+        self._last_departing_timeout_at: Optional[float] = None
+        self.departure_cooldown_after_timeout = self.config.get(
+            'departure_cooldown_after_timeout', 1800)  # 30 min default
 
         # Event history
         self.events: List[PresenceEvent] = []
@@ -795,6 +798,16 @@ class PresenceTracker:
                             f"(frames_identified={frames_pos_id})"
                         )
 
+            # Check departure cooldown after a previous timeout
+            if can_depart and self._last_departing_timeout_at:
+                elapsed_since_timeout = time.time() - self._last_departing_timeout_at
+                if elapsed_since_timeout < self.departure_cooldown_after_timeout:
+                    can_depart = False
+                    logger.debug(
+                        f"Departure cooldown active: {elapsed_since_timeout:.0f}s / "
+                        f"{self.departure_cooldown_after_timeout}s since last timeout"
+                    )
+
             # Require confirmation frames before transitioning
             if can_depart and self.frames_departure_signals >= self.departure_confirmation_frames:
                 self.departure_started_at = time.time()
@@ -847,6 +860,7 @@ class PresenceTracker:
                     self.frames_car_detected = 0
                     self.departure_signals = []
                     self.departure_started_at = None
+                    self._last_departing_timeout_at = time.time()  # Cooldown applies
                     return result
 
         self.frames_car_detected = 0
@@ -877,6 +891,7 @@ class PresenceTracker:
             result['state_changed'] = True
             self.departure_signals = []
             self.departure_started_at = None
+            self._last_departing_timeout_at = time.time()
             return result
 
         # Check if car is now absent
@@ -895,6 +910,7 @@ class PresenceTracker:
                 result['state'] = self.state
                 result['state_changed'] = True
                 self.frames_car_missing = 0
+                self._last_departing_timeout_at = None  # Clear cooldown — real departure
         else:
             # Still detecting something, but might be partially visible
             self.frames_car_missing = max(0, self.frames_car_missing - 1)
