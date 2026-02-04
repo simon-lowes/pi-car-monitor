@@ -337,3 +337,30 @@ The presence tracker entered DEPARTING state at 09:47 AM due to departure signal
 - "Event loop is closed" error on ~50% of Telegram sends (non-critical, pre-existing)
 - Owner recognition has very few samples (0-2 "me" replies) — not yet reliable
 - Video sending still fails with the same event loop error
+
+### Session: 2026-02-04 — Nightly Script Fix + FP Routing Window
+
+**Problems discovered:**
+1. **Nightly analysis script broken since creation** — Both Feb 3 and Feb 4 runs failed with `sh: 1: Syntax error: "(" unexpected`. The script used `printf '%q'` to escape the prompt, but this produces Bash-specific syntax (`$'...'`) that `sh` (used by `script -qc`) cannot parse.
+
+2. **FP feedback routing too strict** — The 5-minute (300s) window for routing "null" replies to the correct handler was too short. User replies 1+ hours after alerts, causing all feedback to fall through to car detection FP handler. Today's logs show 9 "null" replies at 15:10-15:12 and 16:32 all misrouted because the last impact was at 13:54 (76+ minutes earlier).
+
+3. **Transit zones never created** — Because vehicle FPs were misrouted, `data/transit_zones.yaml` was never created. All FP learning went to `data/false_positives.yaml` as car detection zones (which were then rejected for overlapping baseline).
+
+**Today's stats (from logs):**
+- 3 impact recordings (07:11, 08:24, 13:54) — all likely false positives
+- 7 departure alerts, 4 timed out as false, 3 were real departures
+- 9+ "null" replies, all misrouted and discarded
+
+**Changes made:**
+
+#### `scripts/nightly-analyse.sh`
+- **Fixed shell compatibility**: Write prompt to temp file instead of using `printf '%q'`. The prompt is now read via `$(cat $PROMPT_FILE)` which works with POSIX `sh`.
+- **Updated trap**: Cleans up both lock file and temp prompt file.
+
+#### `src/pipeline.py`
+- **Extended FP routing window from 5 minutes to 2 hours (7200s)**: Users reply to alerts much later than 5 minutes. This affects both `_last_contact_alert_info` check and `last_vehicle_contact_info` fallback.
+
+**Service restart required** for pipeline.py change to take effect.
+
+**Git:** Committed and pushed to `origin/main`
