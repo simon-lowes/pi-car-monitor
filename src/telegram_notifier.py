@@ -68,6 +68,10 @@ class TelegramNotifier:
         self._last_update_id = 0
         self._owner_callback: Optional[Callable[[int], None]] = None
 
+        # Track pending alerts for "all null" feature
+        # Each entry: {'type': str, 'timestamp': float, 'confidence': float, ...}
+        self._pending_alerts: List[dict] = []
+
         if not TELEGRAM_AVAILABLE:
             self.enabled = False
             logger.error("Telegram notifications disabled: python-telegram-bot not installed")
@@ -393,8 +397,11 @@ class TelegramNotifier:
             f"Car ID: {id_info}\n"
             f"Time: {timestamp}\n\n"
             f"Recording started...\n\n"
-            f"Reply 'null' if this is wrong (teaches the system)."
+            f"Reply 'null' if wrong, or 'all null' to mark all today's alerts."
         )
+
+        # Record this alert for "all null" tracking
+        self.record_alert(contact_type, confidence, {'car_id': id_info})
 
         return self.send_alert(message, image_data=frame_data)
 
@@ -507,6 +514,11 @@ class TelegramNotifier:
                 if text in ['me', 'mine', 'owner', "that's me", "thats me", "it's me", "its me"]:
                     logger.info("Received owner confirmation reply")
                     self._handle_owner_reply(update.message, loop)
+
+                # Check for "all null" - mark all pending alerts as false positive
+                elif text in ['all null', 'all false', 'all fp', 'all wrong', 'all no']:
+                    logger.info(f"Received 'all null' reply - {len(self._pending_alerts)} pending alerts")
+                    self._handle_all_null_reply(update.message, loop)
 
                 # Check for "null" or variations (false positive)
                 elif text in ['null', 'false', 'no', 'not me', 'notme', 'wrong', 'fp',
@@ -624,6 +636,82 @@ class TelegramNotifier:
     def set_false_positive_callback(self, callback):
         """Set callback for false positive reports."""
         self._false_positive_callback = callback
+
+    def set_all_null_callback(self, callback):
+        """Set callback for 'all null' reports (marks all pending alerts as FP)."""
+        self._all_null_callback = callback
+
+    def record_alert(self, alert_type: str, confidence: float = 0.0, metadata: dict = None):
+        """
+        Record an alert for tracking (used by 'all null' feature).
+
+        Args:
+            alert_type: Type of alert (e.g., 'impact', 'vehicle', 'departure')
+            confidence: Detection confidence
+            metadata: Additional info about the alert
+        """
+        alert = {
+            'type': alert_type,
+            'timestamp': time.time(),
+            'confidence': confidence,
+            'metadata': metadata or {}
+        }
+        self._pending_alerts.append(alert)
+        logger.debug(f"Recorded alert: {alert_type} (pending: {len(self._pending_alerts)})")
+
+    def _handle_all_null_reply(self, message, loop=None):
+        """Handle 'all null' reply - mark all pending alerts as false positive."""
+        if not hasattr(self, '_all_null_callback') or not self._all_null_callback:
+            confirm_text = "All-null not configured. Reply 'null' to individual alerts."
+        else:
+            try:
+                # Call the pipeline's all-null handler which processes all tracked alerts
+                results = self._all_null_callback()
+
+                if not results:
+                    confirm_text = "No pending alerts to mark as false positive."
+                else:
+                    count = len(results)
+                    # Summarize what was learned
+                    unique_types = set(r.split('_')[0] for r in results if r)
+                    type_summary = ', '.join(unique_types) if unique_types else 'various'
+
+                    confirm_text = f"Got it - marked {count} alert(s) as false positives ({type_summary})."
+
+            except Exception as e:
+                logger.error(f"All-null callback failed: {e}")
+                confirm_text = f"Error processing all-null: {e}"
+
+        # Clear local pending alerts too (sync with pipeline)
+        self._pending_alerts.clear()
+
+        # Send confirmation
+        async def _reply():
+            bot = self._get_bot()
+            if bot:
+                try:
+                    await bot.send_message(
+                        chat_id=self.chat_id,
+                        text=confirm_text
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send all-null confirmation: {e}")
+
+        if loop:
+            loop.run_until_complete(_reply())
+        else:
+            self._run_async(_reply())
+
+    def clear_pending_alerts(self):
+        """Clear pending alerts (e.g., at start of new day)."""
+        count = len(self._pending_alerts)
+        self._pending_alerts.clear()
+        if count:
+            logger.info(f"Cleared {count} pending alerts")
+
+    def get_pending_alert_count(self) -> int:
+        """Get number of pending alerts."""
+        return len(self._pending_alerts)
 
 
 def create_notifier_from_config(config: dict) -> Optional[TelegramNotifier]:

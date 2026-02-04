@@ -13,7 +13,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 import queue
 
 import cv2
@@ -131,8 +131,9 @@ class CarMonitorPipeline:
         # Store last frame for snapshot
         self._last_frame = None
 
-        # Track last contact alert for FP feedback routing
+        # Track contact alerts for FP feedback routing (supports "all null")
         self._last_contact_alert_info: Optional[dict] = None
+        self._all_contact_alerts: List[dict] = []  # All alerts, for "all null"
         
         # Performance settings
         perf_config = config.get("performance", {})
@@ -199,6 +200,7 @@ class CarMonitorPipeline:
             # Always start listener - even without owner profile, we need FP feedback
             self.notifier.start_listener(owner_cb or (lambda eid: None))
             self.notifier.set_false_positive_callback(self._on_false_positive_reported)
+            self.notifier.set_all_null_callback(self._on_all_null_reported)
 
         logger.info("Pipeline started")
     
@@ -601,13 +603,15 @@ class CarMonitorPipeline:
                         event['recording_path'] = str(self.recorder._current_recording_path)
 
                 # Track this contact for FP feedback routing
-                self._last_contact_alert_info = {
+                alert_info = {
                     'contact_type': contact.contact_type.value,
                     'confidence': contact.confidence,
                     'location': contact.location,
                     'actor_id': contact.actor_id,
                     'timestamp': timestamp,
                 }
+                self._last_contact_alert_info = alert_info
+                self._all_contact_alerts.append(alert_info)
 
                 # Send Telegram notification with snapshot
                 if self.notifier:
@@ -771,6 +775,60 @@ class CarMonitorPipeline:
 
         # Return detail for Telegram response
         return fp_detail
+
+    def _on_all_null_reported(self) -> List[str]:
+        """
+        Callback when user replies 'all null' to mark all pending alerts as FP.
+
+        Processes all alerts in _all_contact_alerts list.
+
+        Returns:
+            List of FP detail strings for each alert processed
+        """
+        logger.info(f"All null reported - processing {len(self._all_contact_alerts)} alerts")
+
+        results = []
+
+        for alert in self._all_contact_alerts:
+            contact_type = alert.get('contact_type', '')
+            fp_detail = ""
+
+            if contact_type == 'vehicle':
+                fp_detail = self.contact_classifier.record_vehicle_false_positive()
+                logger.info(f"Vehicle contact FP recorded: {fp_detail}")
+            elif contact_type == 'impact':
+                fp_detail = "impact_fp_acknowledged"
+                logger.info(f"Impact FP acknowledged (confidence was {alert.get('confidence', 0):.2f})")
+            else:
+                fp_detail = f"{contact_type}_fp_acknowledged"
+                logger.info(f"Contact FP acknowledged: {contact_type}")
+
+            results.append(fp_detail)
+
+            # Log to database
+            self.database.log_contact_event(
+                event_type='false_positive_reported',
+                confidence=0.0,
+                location=(0, 0),
+                actor_type='user_feedback_all_null',
+                actor_track_id=None,
+                duration=0.0,
+                recording_path=None,
+                metadata={
+                    'session_id': self._session_id,
+                    'fp_detail': fp_detail,
+                    'original_contact_type': contact_type,
+                    'original_confidence': alert.get('confidence', 0),
+                }
+            )
+
+        # Clear the alerts list after processing
+        alert_count = len(self._all_contact_alerts)
+        self._all_contact_alerts.clear()
+        self._last_contact_alert_info = None
+
+        logger.info(f"Cleared {alert_count} alerts after all-null processing")
+        return results
 
     def _get_person_bbox_for_contact(self, contact) -> Optional[tuple]:
         """
