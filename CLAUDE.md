@@ -382,3 +382,24 @@ The presence tracker entered DEPARTING state at 09:47 AM due to departure signal
 - Instructed nightly Claude to fix this script itself if it finds bugs
 
 **Service restart required**
+
+### Session: 2026-02-04 (continued) — "All Null" Feature
+
+**Problem:** Owner has to reply "null" to each individual alert, tedious when multiple false positives occur in a day.
+
+**Changes made:**
+
+#### `src/telegram_notifier.py`
+- **Track pending alerts** via `_pending_alerts` list and `record_alert()` method
+- **Recognize "all null"** (also "all false", "all fp", "all wrong", "all no")
+- **`_handle_all_null_reply()`** calls pipeline's all-null callback
+- **Updated alert message** to show "Reply 'null' if wrong, or 'all null' to mark all today's alerts"
+
+#### `src/pipeline.py`
+- **Track all contact alerts** in `_all_contact_alerts` list (not just the last one)
+- **`_on_all_null_reported()`** processes and clears the entire alert list
+- Wired up via `set_all_null_callback()` on notifier
+
+**Usage:** Reply "all null" to any alert message to mark ALL pending alerts as false positives at once.
+
+**Service restarted:** 17:43 UTC
