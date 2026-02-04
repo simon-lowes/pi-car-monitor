@@ -364,3 +364,21 @@ The presence tracker entered DEPARTING state at 09:47 AM due to departure signal
 **Service restart required** for pipeline.py change to take effect.
 
 **Git:** Committed and pushed to `origin/main`
+
+### Session: 2026-02-04 (continued) — Remove Time Limits, True Autonomy
+
+**Problem:** Owner pointed out that the 2-hour FP routing window was still wrong — they might reply days later. The nightly script also needed `--dangerously-skip-permissions` to actually execute tools.
+
+**Changes made:**
+
+#### `src/pipeline.py`
+- **Removed time limit entirely** from FP routing. The last contact alert is tracked, and "null" replies always route to it regardless of when the user replies.
+
+#### `scripts/nightly-analyse.sh`
+- **Added `--dangerously-skip-permissions`** so Claude can actually run bash commands and make edits without approval prompts
+- Increased timeout to 15 minutes, max turns to 30
+- Removed `set -e` so script continues on errors
+- Better logging with timestamps
+- Instructed nightly Claude to fix this script itself if it finds bugs
+
+**Service restart required**
