@@ -705,8 +705,9 @@ class CarMonitorPipeline:
         fp_detail = "zone_recorded"
 
         # Check what the last alert was (contact alerts take priority)
+        # Use 2-hour window since users often reply to alerts much later
         last_contact = self._last_contact_alert_info
-        if last_contact and (time.time() - last_contact.get('timestamp', 0)) < 300:
+        if last_contact and (time.time() - last_contact.get('timestamp', 0)) < 7200:
             contact_type = last_contact.get('contact_type', '')
 
             if contact_type == 'vehicle':
@@ -728,7 +729,7 @@ class CarMonitorPipeline:
         else:
             # No recent contact alert — check vehicle contact info as fallback
             last_vehicle_info = self.contact_classifier.last_vehicle_contact_info
-            if last_vehicle_info and (time.time() - last_vehicle_info.get('timestamp', 0)) < 300:
+            if last_vehicle_info and (time.time() - last_vehicle_info.get('timestamp', 0)) < 7200:
                 fp_detail = self.contact_classifier.record_vehicle_false_positive()
                 logger.info(f"Vehicle contact FP recorded: {fp_detail}")
             else:

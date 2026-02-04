@@ -69,7 +69,13 @@ RULES:
 
 cd "$PROJECT_DIR"
 
-timeout "$TIMEOUT_SECONDS" script -qc "claude -p $(printf '%q' "$PROMPT") \
+# Write prompt to a temp file to avoid shell quoting issues
+# (printf %q produces Bash-specific escapes that sh can't parse)
+PROMPT_FILE=$(mktemp)
+echo "$PROMPT" > "$PROMPT_FILE"
+trap "rm -f $LOCKFILE $PROMPT_FILE" EXIT
+
+timeout "$TIMEOUT_SECONDS" script -qc "claude -p \"\$(cat $PROMPT_FILE)\" \
     --allowedTools 'Bash,Read,Edit,Write,Grep,Glob' \
     --max-turns $MAX_TURNS \
     --output-format text" /dev/null >> "$LOG_FILE" 2>&1
