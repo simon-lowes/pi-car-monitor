@@ -434,7 +434,26 @@ The presence tracker entered DEPARTING state at 09:47 AM due to departure signal
 - pyright-lsp, commit-commands, code-review, security-guidance, pr-review-toolkit
 - Agent teams enabled via `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`
 
+**Implemented fixes from agent team analysis (same session):**
+
+#### `config/config.yaml`
+- **Raised `motion_ratio_threshold` from 0.25 to 0.40** — the analyst found 165 impact FPs in 24h, all caused by shadows/weather/light changes. 40% of car zone pixels changing is a genuinely significant event. All 165 of yesterday's FPs would be filtered.
+- **Added `cooldown_seconds: 30`** to impact config — prevents spam during sustained events (rain, construction, etc.)
+
+#### `src/contact_classifier.py`
+- **Added impact cooldown** (`impact_cooldown_seconds`, default 30s): After an impact alert, suppresses further impacts for 30 seconds. Prevents clusters like the ~90 impacts in 30 minutes seen on Feb 5.
+- **`_last_impact_timestamp` tracking**: Timestamps each impact, checked before generating new events.
+- **Fixed confidence formula** from `motion_ratio * 3` to `motion_ratio * 2` — the 3x multiplier made the min_confidence filter mathematically useless (any motion above 0.25 threshold produced confidence >= 0.75, always passing the 0.65 filter)
+
+#### `src/presence_tracker.py`
+- **Rapid departure-return cycle detection** in `_handle_returning_state()`: If the entire departure→absent→returning→present cycle completes in under 5 minutes, it's treated as detection flickering, not a real trip. Sets cooldown to prevent re-triggering. Suppresses the return alert for these false cycles.
+- This fixes the 23 rapid departure-absence cycles between 09:10-11:36 on Feb 5 where detection flickered off for a few frames and the system thought the car left and returned.
+
+#### `scripts/nightly-analyse.sh`
+- **Removed timeout entirely** — agent teams run to completion. Lockfile prevents overlapping runs.
+- **Increased max-turns from 50 to 75** for agent team coordination
+
 **Current state:**
-- Service running since Feb 4 17:43 UTC, presence=ABSENT (car not parked)
-- Nightly script will run tonight at 3 AM — should work now
-- 83 impact recordings on Feb 5 is concerning — nightly agent team should investigate this tomorrow
+- Service needs restart to apply the 4 code/config changes
+- Nightly script runs every night at 3 AM via cron, no timeout, agent teams for cross-checking
+- All commits and pushes happen automatically via nightly script and via this session

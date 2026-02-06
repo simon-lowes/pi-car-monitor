@@ -16,8 +16,7 @@ PROJECT_DIR="/home/PiAi/pi-car-monitor"
 LOG_DIR="${PROJECT_DIR}/logs/nightly"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="${LOG_DIR}/analysis_${TIMESTAMP}.log"
-MAX_TURNS=50
-TIMEOUT_SECONDS=1500  # 25 minutes (teams need more turns)
+MAX_TURNS=75
 
 mkdir -p "$LOG_DIR"
 
@@ -121,17 +120,17 @@ cd "$PROJECT_DIR"
 log "Running Claude Code analysis with agent teams..."
 
 # Run Claude with dangerously-skip-permissions for full autonomy
-# Using script wrapper for TTY
-timeout "$TIMEOUT_SECONDS" script -qec "claude -p \"\$(cat $PROMPT_FILE)\" \
+# No timeout — let the agent teams run to completion. The lockfile
+# prevents overlapping runs. If it hangs, the next night's run
+# will be skipped and the owner can investigate.
+script -qec "claude -p \"\$(cat $PROMPT_FILE)\" \
     --dangerously-skip-permissions \
     --max-turns $MAX_TURNS \
     --output-format text" /dev/null >> "$LOG_FILE" 2>&1
 
 EXIT_CODE=$?
 
-if [ $EXIT_CODE -eq 124 ]; then
-    log "=== TIMEOUT: Analysis exceeded ${TIMEOUT_SECONDS}s ==="
-elif [ $EXIT_CODE -ne 0 ]; then
+if [ $EXIT_CODE -ne 0 ]; then
     log "=== ERROR: Claude exited with code $EXIT_CODE ==="
     log "Attempting to commit error log for visibility..."
 fi

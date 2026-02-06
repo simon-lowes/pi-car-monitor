@@ -1,0 +1,143 @@
+alerts:
+  enabled: true
+  local_sound:
+    enabled: false
+    sound_file: /home/PiAi/pi-car-monitor/assets/alert.wav
+  telegram:
+    enabled: true
+    bot_token: "7853008456:AAEJvCpe8VIbltHAKK5r4M30RCJ5mxsYOFk"
+    chat_id: "941775623"
+    send_on_start: true
+    send_video_on_end: true
+    max_chunk_size_mb: 50
+camera:
+  device: /dev/video0
+  framerate: 15
+  resolution:
+    height: 1080
+    width: 1920
+debug:
+  debug_frame_dir: /home/PiAi/pi-car-monitor/data/debug
+  display_output: false
+  enabled: false
+  save_debug_frames: false
+detection:
+  car_confidence: 0.85
+  contact_confidence: 0.7
+  contact_dwell_time: 1.5
+  proximity_confidence: 0.2
+  trackable_objects:
+  - person
+  - bicycle
+  - motorcycle
+  - car
+  - truck
+  - dog
+
+  # Impact detection settings (sudden motion near car)
+  impact:
+    motion_ratio_threshold: 0.40    # 40% of car zone pixels must change (was 25%, raised due to 165 FPs/day from shadows/weather)
+    min_confidence: 0.65            # Minimum confidence to trigger impact alert
+    cooldown_seconds: 30            # Minimum seconds between impact alerts (prevents spam during sustained events)
+
+  # Vehicle contact detection settings (reduces false positives from parked cars)
+  vehicle_contact:
+    overlap_threshold: 0.20       # 20% bbox overlap required (was 5%)
+    persistence_frames: 5         # Must overlap for 5 consecutive frames (~0.3s at 15fps)
+    cooldown_seconds: 60.0        # Minimum 60s between alerts for same vehicle
+    stationary_threshold: 15      # Pixels of movement required to be "moving"
+    stationary_frames: 30         # Frames to track for stationary detection (~2s)
+logging:
+  events_db: /home/PiAi/pi-car-monitor/logs/events.db
+  file: /home/PiAi/pi-car-monitor/logs/car-monitor.log
+  level: INFO
+  log_contacts: true
+  log_detections: true
+  log_proximity: true
+  log_recordings: true
+performance:
+  batch_size: 1
+  detection_frame_skip: 2
+  hailo_device: /dev/hailo0
+  proximity_frame_skip: 1
+  use_hailo: true
+plate_recognition:
+  enabled: true
+  hash_algorithm: sha256
+  local_only: true
+  salt_file: /home/PiAi/pi-car-monitor/config/.plate_salt
+  store_hash_only: true
+recording:
+  auto_delete_days: 30
+  codec: h264
+  format: mp4
+  max_duration_seconds: 300
+  max_storage_gb: 100
+  output_dir: /home/PiAi/pi-car-monitor/data/recordings
+  post_buffer_seconds: 5
+  pre_buffer_seconds: 10
+owner_recognition:
+  enabled: true
+  learning_enabled: true
+  profile_path: /home/PiAi/pi-car-monitor/config/.owner_profile
+  confidence_threshold: 0.7
+zones:
+  car_zone:
+    enabled: true
+    x_max: 0.9
+    x_min: 0.1
+    y_max: 0.95
+    y_min: 0.2
+  proximity_buffer: 75
+
+# Presence tracking - detects car departure and return
+presence_tracking:
+  enabled: true
+  baseline_path: /home/PiAi/pi-car-monitor/data/car_baseline.yaml
+
+  # Baseline establishment
+  baseline_stability_frames: 10   # Frames of stable detection before baseline set
+  position_tolerance_px: 50       # Allowed drift from baseline center (pixels)
+  area_tolerance_pct: 0.15        # Allowed size change (15%)
+
+  # Departure detection
+  departure_confirmation_frames: 5    # Frames of signals before DEPARTING state
+  absence_confirmation_frames: 30     # Frames without car before ABSENT state
+  return_stability_frames: 10         # Frames of stable detection before PRESENT
+  departing_timeout_seconds: 180      # Max seconds in DEPARTING before reverting to PRESENT
+  departure_cooldown_after_timeout: 1800  # 30 min cooldown after timeout before allowing new DEPARTING
+
+  # Low-light detection
+  enable_light_detection: true
+  tail_light_min_area: 50             # Minimum blob size for light detection
+  light_persistence_frames: 3         # Frames light must persist to be valid
+  motion_threshold: 0.02              # 2% of zone must change for motion
+  significant_motion_threshold: 0.10  # 10% = major movement
+
+  # Motion analysis
+  enable_optical_flow: true           # Use optical flow for motion direction
+  car_sized_motion_threshold: 0.10    # 10% of zone = car-sized motion
+
+# Temporal pattern learning - learns your usage patterns
+temporal_patterns:
+  enabled: true
+  data_path: /home/PiAi/pi-car-monitor/data/temporal_patterns.yaml
+
+  # Pattern detection
+  min_occurrences_for_pattern: 2      # Need 2+ events to form a pattern
+  time_cluster_window_minutes: 30     # Events within 30min = same pattern
+
+  # Confidence settings
+  pattern_confidence_base: 0.5
+  pattern_confidence_per_occurrence: 0.1
+  max_pattern_confidence: 0.95
+
+  # Pattern decay (reduce confidence for stale patterns)
+  pattern_decay_days: 30              # Days without occurrence before decay starts
+
+  # Alert suppression
+  suppress_alerts_after_confirmations: 10  # Suppress after N confirmations of same pattern
+  suppress_confidence_threshold: 0.85      # Only suppress if pattern confidence >= this
+
+  # Storage
+  max_stored_events: 500              # Max events to keep in history

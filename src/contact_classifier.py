@@ -126,8 +126,10 @@ class ContactClassifier:
 
         # Impact detection settings
         impact_config = detection_config.get("impact", {})
-        self.impact_motion_ratio_threshold = impact_config.get("motion_ratio_threshold", 0.25)
+        self.impact_motion_ratio_threshold = impact_config.get("motion_ratio_threshold", 0.40)
         self.impact_min_confidence = impact_config.get("min_confidence", 0.65)
+        self.impact_cooldown_seconds = impact_config.get("cooldown_seconds", 30)
+        self._last_impact_timestamp = 0.0
 
         # Motion analysis
         self.prev_frame = None
@@ -865,7 +867,7 @@ class ContactClassifier:
         
         # Sudden significant motion = potential impact
         if motion_ratio > self.impact_motion_ratio_threshold:
-            confidence = min(motion_ratio * 3, 1.0)
+            confidence = min(motion_ratio * 2, 1.0)
 
             # Apply minimum confidence filter
             if confidence < self.impact_min_confidence:
@@ -874,6 +876,16 @@ class ContactClassifier:
                     f"{self.impact_min_confidence} (motion_ratio={motion_ratio:.3f})"
                 )
                 return None
+
+            # Apply cooldown to prevent spam during sustained events (rain, shadows, wind)
+            if timestamp - self._last_impact_timestamp < self.impact_cooldown_seconds:
+                logger.debug(
+                    f"Impact cooldown active: {timestamp - self._last_impact_timestamp:.1f}s < "
+                    f"{self.impact_cooldown_seconds}s"
+                )
+                return None
+
+            self._last_impact_timestamp = timestamp
 
             # Find center of motion
             motion_mask = diff_gray > self.motion_threshold

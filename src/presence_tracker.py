@@ -970,18 +970,32 @@ class PresenceTracker:
                 if light_conditions != 'night':
                     self.establish_baseline(frame, car_bbox, car_confidence)
 
+                # Check if this was a rapid departure-return cycle (< 5 min)
+                # If so, it was likely detection flickering, not a real trip
+                rapid_cycle = False
+                if self.departure_started_at:
+                    cycle_duration = time.time() - self.departure_started_at
+                    if cycle_duration < 300:  # 5 minutes
+                        rapid_cycle = True
+                        logger.info(
+                            f"Rapid departure-return cycle ({cycle_duration:.0f}s) — "
+                            f"treating as detection flicker, applying cooldown"
+                        )
+                        self._last_departing_timeout_at = time.time()
+
                 self._transition_state(
                     PresenceState.PRESENT,
                     'car_returned',
                     {
                         'light_conditions': light_conditions,
-                        'baseline_updated': light_conditions != 'night'
+                        'baseline_updated': light_conditions != 'night',
+                        'rapid_cycle': rapid_cycle
                     }
                 )
                 result['state'] = self.state
                 result['state_changed'] = True
-                result['should_alert'] = True
-                result['alert_reason'] = 'car_returned'
+                result['should_alert'] = not rapid_cycle  # Don't alert on flicker
+                result['alert_reason'] = 'car_returned' if not rapid_cycle else None
                 result['baseline'] = self.baseline
                 self.frames_car_detected = 0
 
