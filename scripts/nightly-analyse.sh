@@ -1,6 +1,6 @@
 #!/bin/bash
 # Nightly Claude Code analysis of pi-car-monitor
-# Runs headless, analyses the day's logs, and fixes issues autonomously.
+# Runs headless, uses agent teams for cross-checking.
 #
 # Install: crontab -e → 0 3 * * * /home/PiAi/pi-car-monitor/scripts/nightly-analyse.sh
 #
@@ -8,12 +8,16 @@
 
 set -uo pipefail  # Don't exit on error (-e removed) — we want to handle failures
 
+# Ensure claude is in PATH (cron doesn't load user profile)
+export PATH="/home/PiAi/.local/bin:$PATH"
+export HOME="/home/PiAi"
+
 PROJECT_DIR="/home/PiAi/pi-car-monitor"
 LOG_DIR="${PROJECT_DIR}/logs/nightly"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="${LOG_DIR}/analysis_${TIMESTAMP}.log"
-MAX_TURNS=30
-TIMEOUT_SECONDS=900  # 15 minutes max
+MAX_TURNS=50
+TIMEOUT_SECONDS=1500  # 25 minutes (teams need more turns)
 
 mkdir -p "$LOG_DIR"
 
@@ -39,20 +43,26 @@ log() {
 
 log "=== Nightly analysis started ==="
 
-# Collect yesterday's stats for the prompt
-ALERT_COUNT=$(journalctl -u car-monitor.service --since "yesterday" --until "today" --no-pager 2>/dev/null | grep -c "Departure alert sent" || echo "0")
-TIMEOUT_COUNT=$(journalctl -u car-monitor.service --since "yesterday" --until "today" --no-pager 2>/dev/null | grep -c "departing_timeout" || echo "0")
-IMPACT_COUNT=$(journalctl -u car-monitor.service --since "yesterday" --until "today" --no-pager 2>/dev/null | grep -c "Recording started: impact" || echo "0")
-VEHICLE_FP_COUNT=$(journalctl -u car-monitor.service --since "yesterday" --until "today" --no-pager 2>/dev/null | grep -c "ignoring vehicle" || echo "0")
-FP_REPORTS=$(journalctl -u car-monitor.service --since "yesterday" --until "today" --no-pager 2>/dev/null | grep -c "False positive reported" || echo "0")
-ERRORS=$(journalctl -u car-monitor.service --since "yesterday" --until "today" --no-pager 2>/dev/null | grep -c "\[ERROR\]" || echo "0")
+# Collect yesterday's stats — use subshell to avoid grep -c exit code 1 on zero matches
+count_matches() {
+    local count
+    count=$(journalctl -u car-monitor.service --since "yesterday" --until "today" --no-pager 2>/dev/null | grep -c "$1" 2>/dev/null) || true
+    echo "${count:-0}"
+}
+
+ALERT_COUNT=$(count_matches "Departure alert sent")
+TIMEOUT_COUNT=$(count_matches "departing_timeout")
+IMPACT_COUNT=$(count_matches "Recording started: impact")
+VEHICLE_FP_COUNT=$(count_matches "ignoring vehicle")
+FP_REPORTS=$(count_matches "False positive reported")
+ERRORS=$(count_matches "\[ERROR\]")
 
 log "Stats: departures=$ALERT_COUNT timeouts=$TIMEOUT_COUNT impacts=$IMPACT_COUNT filtered=$VEHICLE_FP_COUNT fp_reports=$FP_REPORTS errors=$ERRORS"
 
 # Write prompt to temp file (avoids shell quoting issues)
 PROMPT_FILE=$(mktemp)
 cat > "$PROMPT_FILE" << 'PROMPT_END'
-You are the overnight maintenance agent for pi-car-monitor. Read CLAUDE.md for full project context.
+You are the overnight maintenance lead for pi-car-monitor. Read CLAUDE.md for full project context.
 
 YESTERDAY'S STATS:
 PROMPT_END
@@ -68,32 +78,50 @@ STATS_END
 
 cat >> "$PROMPT_FILE" << 'PROMPT_END'
 
-YOUR TASK:
-1. Read the last 24h of journalctl logs: journalctl -u car-monitor.service --since "yesterday" --no-pager
-2. Look for patterns: repeated FPs, errors, state issues, wasted user feedback
-3. Read data/false_positives.yaml and data/transit_zones.yaml for learned zones
-4. Read config/config.yaml for current thresholds
-5. If you find clear fixes (threshold adjustments, bug fixes), implement them
-6. Write a summary to this session's log file
-7. Update CLAUDE.md changelog if you made code changes
-8. Git add, commit with descriptive message, and push to origin/main
+YOUR TASK — USE AGENT TEAMS:
+You MUST use agent teams (TeamCreate) to coordinate multiple agents that cross-check each other's work. Here is your workflow:
+
+1. Create a team with TeamCreate (e.g. team_name "nightly-analysis")
+2. Create tasks with TaskCreate for each phase of work
+3. Spawn the following agents as teammates using the Task tool with team_name:
+
+   AGENT 1 — "log-analyst" (subagent_type: general-purpose)
+   Task: Read the last 24h of journalctl logs (journalctl -u car-monitor.service --since "yesterday" --no-pager), read data/false_positives.yaml, data/transit_zones.yaml, and config/config.yaml. Identify patterns: repeated FPs, errors, state machine issues, wasted feedback, threshold problems. Report findings with specific evidence (log lines, timestamps, counts). Propose specific fixes with file paths and what to change.
+
+   AGENT 2 — "code-reviewer" (subagent_type: general-purpose)
+   Task: Wait for the log-analyst's findings. Then review each proposed fix by reading the relevant source files. For each proposal, assess: (a) Is the diagnosis correct? (b) Will the fix work? (c) Could it cause regressions? (d) Is there a simpler approach? Reject proposals that are risky or poorly justified. Approve proposals that are safe and well-evidenced. Be skeptical — the analyst might misread logs or propose over-engineered fixes.
+
+4. As team lead, you coordinate:
+   - First assign the analyst task, wait for their report
+   - Then assign the reviewer task with the analyst's findings
+   - Only implement fixes that the reviewer APPROVES
+   - If they disagree, use your judgement but err on the side of caution
+   - Implement approved fixes yourself (you are the only one who edits code)
+
+5. After implementing:
+   - Update CLAUDE.md changelog if you made code changes
+   - Git add, commit with descriptive message, and push via: gh auth setup-git && git push origin main
+   - Shut down teammates when done (SendMessage with type: shutdown_request)
+   - Delete the team with TeamDelete
+
+6. If no fixes are needed, just log "No issues found" and clean up.
 
 RULES:
-- Make changes you're confident about. Document uncertainties but still fix obvious issues.
+- Only implement fixes that survive scrutiny from the reviewer agent
 - Never change Telegram tokens, chat IDs, or security settings
 - Never delete recordings or user data
 - Keep changes minimal and focused
-- The service will auto-reload on file changes, or the owner will restart it
-- If something blocks you (permissions, missing files), log it clearly and continue with what you can do
+- The service needs manual restart to apply code changes — note this in the commit message
+- If something blocks you, log it clearly and continue with what you can do
 - If this script itself has bugs, fix them
 PROMPT_END
 
 cd "$PROJECT_DIR"
 
-log "Running Claude Code analysis..."
+log "Running Claude Code analysis with agent teams..."
 
 # Run Claude with dangerously-skip-permissions for full autonomy
-# Using script wrapper for TTY, but Claude can now actually execute tools
+# Using script wrapper for TTY
 timeout "$TIMEOUT_SECONDS" script -qec "claude -p \"\$(cat $PROMPT_FILE)\" \
     --dangerously-skip-permissions \
     --max-turns $MAX_TURNS \
@@ -105,14 +133,12 @@ if [ $EXIT_CODE -eq 124 ]; then
     log "=== TIMEOUT: Analysis exceeded ${TIMEOUT_SECONDS}s ==="
 elif [ $EXIT_CODE -ne 0 ]; then
     log "=== ERROR: Claude exited with code $EXIT_CODE ==="
-
-    # If Claude failed, try to push whatever logs we have
     log "Attempting to commit error log for visibility..."
 fi
 
 log "=== Nightly analysis completed ==="
 
-# Git operations — commit and push any changes
+# Git operations — commit and push any changes Claude didn't already commit
 cd "$PROJECT_DIR"
 
 # Check for changes in tracked files OR new files in safe directories
@@ -120,7 +146,7 @@ CHANGED=$(git diff --name-only HEAD 2>/dev/null || true)
 UNTRACKED=$(git ls-files --others --exclude-standard -- src/ scripts/ CLAUDE.md 2>/dev/null || true)
 
 if [ -n "$CHANGED" ] || [ -n "$UNTRACKED" ]; then
-    log "Git: found changes to commit"
+    log "Git: found uncommitted changes, committing..."
 
     # Stage safe files only
     git add src/ scripts/ CLAUDE.md 2>> "$LOG_FILE" || true
@@ -131,10 +157,10 @@ if [ -n "$CHANGED" ] || [ -n "$UNTRACKED" ]; then
 
         git commit -m "nightly: automated analysis ${DATE_STR}
 
-Changes from overnight Claude Code maintenance agent.
+Changes from overnight Claude Code maintenance agent team.
 See logs/nightly/analysis_${TIMESTAMP}.log for details.
 
-Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>" >> "$LOG_FILE" 2>&1
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>" >> "$LOG_FILE" 2>&1
 
         # Push
         gh auth setup-git >> "$LOG_FILE" 2>&1 || true

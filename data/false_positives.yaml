@@ -1,4 +1,4 @@
-count: 2
+count: 4
 false_positive_zones:
 - area: 26215
   bbox:
@@ -19,4 +19,24 @@ false_positive_zones:
   center:
   - 791
   - 690
-  count: 2
+  count: 5
+- area: 26169
+  bbox:
+  - 1452
+  - 349
+  - 1595
+  - 532
+  center:
+  - 1523
+  - 440
+  count: 13
+- area: 131652
+  bbox:
+  - 1572
+  - 6
+  - 1848
+  - 483
+  center:
+  - 1710
+  - 244
+  count: 3

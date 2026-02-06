@@ -403,3 +403,38 @@ The presence tracker entered DEPARTING state at 09:47 AM due to departure signal
 **Usage:** Reply "all null" to any alert message to mark ALL pending alerts as false positives at once.
 
 **Service restarted:** 17:43 UTC
+
+### Session: 2026-02-06 — Nightly Script PATH Fix + Agent Teams
+
+**Problems fixed:**
+1. **`claude: not found` in nightly cron** — Feb 3, 4, 5, and 6 nightly runs all failed because cron doesn't load the user's profile, so `~/.local/bin` wasn't in PATH. The `claude` binary lives at `/home/PiAi/.local/bin/claude`.
+2. **Garbled stats output** — `grep -c` returns exit code 1 when count is 0, and `|| echo "0"` appended a second "0" on a new line, garbling the log output (e.g. "filtered=0\n0 fp_reports=1 errors=111").
+
+**Changes made:**
+
+#### `scripts/nightly-analyse.sh`
+- **Added `export PATH="/home/PiAi/.local/bin:$PATH"` and `export HOME`** at top of script — fixes the cron PATH issue
+- **Replaced inline `grep -c ... || echo "0"` with `count_matches()` function** — uses `|| true` after assignment to handle grep exit code 1 cleanly, no more garbled output
+- **Rewrote prompt to use agent teams** — nightly Claude now creates a team with:
+  - **log-analyst**: reads logs, identifies patterns, proposes fixes with evidence
+  - **code-reviewer**: scrutinizes each proposal for correctness, regressions, and over-engineering; rejects poorly justified fixes
+  - **team lead** (main Claude): only implements fixes that survive the reviewer's scrutiny
+- **Increased max-turns from 30 to 50** and **timeout from 15 to 25 minutes** — agent teams need more coordination turns
+- **Updated Co-Authored-By to Opus 4.6**
+
+**Nightly workflow now:**
+1. Lead creates team, spawns log-analyst
+2. Analyst reads 24h of journalctl, data files, config — reports findings with evidence
+3. Lead spawns code-reviewer with analyst's findings
+4. Reviewer checks each proposal against source code, approves or rejects
+5. Lead implements only approved fixes, commits, pushes
+6. Team cleaned up
+
+**Also installed Claude Code plugins (pre-crash):**
+- pyright-lsp, commit-commands, code-review, security-guidance, pr-review-toolkit
+- Agent teams enabled via `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`
+
+**Current state:**
+- Service running since Feb 4 17:43 UTC, presence=ABSENT (car not parked)
+- Nightly script will run tonight at 3 AM — should work now
+- 83 impact recordings on Feb 5 is concerning — nightly agent team should investigate this tomorrow

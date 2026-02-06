@@ -11,6 +11,18 @@ patterns:
   duration_std_dev: null
   created_at: '2026-01-25T20:22:37.932030'
   description: null
+- pattern_id: 2
+  day_of_week: 4
+  day_name: Friday
+  time_window_start: '17:52'
+  time_window_end: '18:22'
+  occurrence_count: 2
+  last_occurred: '2026-01-30T18:07:32.358441'
+  confidence: 0.7
+  typical_duration_minutes: 785
+  duration_std_dev: null
+  created_at: '2026-01-30T18:07:32.358647'
+  description: null
 events:
 - timestamp: '2026-01-25T20:22:37.880252'
   day_of_week: 6
@@ -68,5 +80,21 @@ events:
   return_time: '2026-01-27T07:15:18.006241'
   duration_minutes: 2092
   light_conditions: null
-last_updated: '2026-01-27T07:15:18.018475'
+- timestamp: '2026-01-30T18:07:24.444836'
+  day_of_week: 4
+  time_of_day: '18:07:24'
+  was_owner: true
+  owner_confidence: 0.7
+  return_time: null
+  duration_minutes: null
+  light_conditions: null
+- timestamp: '2026-01-30T18:07:32.358441'
+  day_of_week: 4
+  time_of_day: '18:07:32'
+  was_owner: true
+  owner_confidence: 0.7
+  return_time: '2026-01-31T07:13:05.939692'
+  duration_minutes: 785
+  light_conditions: null
+last_updated: '2026-01-31T07:13:05.940793'
 version: 1

@@ -1,37 +1,37 @@
 baseline:
-  area: 25752
+  area: 124542
   area_tolerance_pct: 0.15
   bbox:
-    x1: 719
-    x2: 867
-    y1: 603
-    y2: 777
+    x1: 818
+    x2: 1151
+    y1: 707
+    y2: 1081
   center:
-  - 793
-  - 690
-  confidence: 0.8697635876802463
-  established_at: '2026-01-28T13:26:19.324514'
-  established_at_unix: 1769606779.3245142
+  - 984
+  - 894
+  confidence: 0.0
+  established_at: '2026-02-05T17:09:03.431563'
+  established_at_unix: 1770311343.4315634
   frame_height: 1080
   frame_width: 1920
   light_conditions: twilight
   position_tolerance: 50
 history:
-- area: 25230
+- area: 56392
   area_tolerance_pct: 0.15
   bbox:
-    x1: 719
-    x2: 864
-    y1: 603
-    y2: 777
+    x1: 741
+    x2: 893
+    y1: 105
+    y2: 476
   center:
-  - 791
-  - 690
-  confidence: 0.8665107034986778
-  established_at: '2026-01-28T13:25:29.447682'
-  established_at_unix: 1769606729.4476824
+  - 817
+  - 290
+  confidence: 0.0
+  established_at: '2026-02-05T16:36:02.602020'
+  established_at_unix: 1770309362.6020203
   frame_height: 1080
   frame_width: 1920
   light_conditions: twilight
   position_tolerance: 50
-last_updated: '2026-01-28T13:26:19.345357'
+last_updated: '2026-02-05T17:09:03.447466'
