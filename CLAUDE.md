@@ -479,10 +479,10 @@ The presence tracker entered DEPARTING state at 09:47 AM due to departure signal
 #### `config/config.yaml`
 - **Raised `motion_ratio_threshold` from 0.40 to 0.50** — 50% of car zone pixels must change. The 0.84-confidence FP (motion_ratio ~0.42) would be filtered. The five 1.00-confidence FPs would not (they need further investigation), but this catches borderline cases.
 - **Raised impact `cooldown_seconds` from 30 to 120** — the 4-event cluster within 3 minutes (13:09-13:12) showed 30s was too short for sustained environmental conditions. 120s prevents rapid-fire alerts during wind/shadow/construction events.
-- **Raised `departure_cooldown_after_timeout` from 1800 to 3600** (30 min → 60 min) — the afternoon showed 4 consecutive false departures at exactly 30-minute intervals. Real departures clear the cooldown (via `_last_departing_timeout_at = None` on ABSENT transition), so this has zero effect on real departure detection.
+- **Departure cooldown kept at 1800** (30 min) — the analyst proposed increasing to 3600 but the code-reviewer rejected: the twilight gate (Fix 1a) addresses the root cause, and a longer cooldown risks suppressing real departures if the owner leaves shortly after a false timeout.
 
 **Expected impact:**
-- False departure alerts: 8 → likely 0-1 (twilight gate blocks unverified signals; longer cooldown as backup)
+- False departure alerts: 8 → likely 0-1 (twilight gate blocks unverified signals; 30 min cooldown as backup)
 - Impact FPs: 6 → likely 2-4 (cooldown reduces clusters, threshold catches borderline cases; high-confidence environmental FPs remain)
 - Baseline drift: eliminated for timeout case; area guard prevents tiny object baselines in all cases
 

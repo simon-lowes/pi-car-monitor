@@ -105,7 +105,7 @@ presence_tracking:
   absence_confirmation_frames: 30     # Frames without car before ABSENT state
   return_stability_frames: 10         # Frames of stable detection before PRESENT
   departing_timeout_seconds: 180      # Max seconds in DEPARTING before reverting to PRESENT
-  departure_cooldown_after_timeout: 3600  # 60 min cooldown after timeout before allowing new DEPARTING (was 30 min, doubled due to persistent false departure signals)
+  departure_cooldown_after_timeout: 1800  # 30 min cooldown after timeout before allowing new DEPARTING
 
   # Low-light detection
   enable_light_detection: true
