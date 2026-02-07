@@ -36,9 +36,9 @@ detection:
 
   # Impact detection settings (sudden motion near car)
   impact:
-    motion_ratio_threshold: 0.40    # 40% of car zone pixels must change (was 25%, raised due to 165 FPs/day from shadows/weather)
+    motion_ratio_threshold: 0.50    # 50% of car zone pixels must change (was 40%, raised due to 6 FPs on Feb 6 from sustained environmental motion)
     min_confidence: 0.65            # Minimum confidence to trigger impact alert
-    cooldown_seconds: 30            # Minimum seconds between impact alerts (prevents spam during sustained events)
+    cooldown_seconds: 120           # Minimum seconds between impact alerts (was 30s, raised to prevent clusters during sustained events)
 
   # Vehicle contact detection settings (reduces false positives from parked cars)
   vehicle_contact:
@@ -105,7 +105,7 @@ presence_tracking:
   absence_confirmation_frames: 30     # Frames without car before ABSENT state
   return_stability_frames: 10         # Frames of stable detection before PRESENT
   departing_timeout_seconds: 180      # Max seconds in DEPARTING before reverting to PRESENT
-  departure_cooldown_after_timeout: 1800  # 30 min cooldown after timeout before allowing new DEPARTING
+  departure_cooldown_after_timeout: 3600  # 60 min cooldown after timeout before allowing new DEPARTING (was 30 min, doubled due to persistent false departure signals)
 
   # Low-light detection
   enable_light_detection: true

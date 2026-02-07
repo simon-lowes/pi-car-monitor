@@ -349,6 +349,15 @@ class PresenceTracker:
             logger.debug("Skipping baseline establishment in night conditions")
             return False
 
+        # Reject tiny detections that clearly aren't a car
+        new_area = self._calculate_area(car_bbox)
+        if new_area < 5000:
+            logger.warning(
+                f"Rejecting baseline update: area {new_area} too small for a car "
+                f"(minimum 5000). Likely a false detection."
+            )
+            return False
+
         frame_h, frame_w = frame.shape[:2]
 
         # Store previous baseline before updating
@@ -780,7 +789,7 @@ class PresenceTracker:
             # before accepting departure signals. This prevents neighbor car
             # activity from triggering false departure alerts.
             can_depart = True
-            if light_conditions == 'daylight':
+            if light_conditions in ('daylight', 'twilight'):
                 frames_pos_id = getattr(self, '_frames_positively_identified', 0)
                 if frames_pos_id < 3:
                     # Car hasn't been positively identified recently in daylight.
@@ -875,9 +884,9 @@ class PresenceTracker:
                 f"reverting to PRESENT"
             )
 
-            # Update baseline if we have a good detection in daylight
-            if car_bbox and light_conditions != 'night':
-                self.establish_baseline(frame, car_bbox, car_confidence)
+            # Don't update baseline on timeout — the detection that triggered
+            # the false departure may be a neighboring car, not ours.
+            # Keep the existing known-good baseline.
 
             self._transition_state(
                 PresenceState.PRESENT,

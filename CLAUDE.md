@@ -457,3 +457,39 @@ The presence tracker entered DEPARTING state at 09:47 AM due to departure signal
 - Service needs restart to apply the 4 code/config changes
 - Nightly script runs every night at 3 AM via cron, no timeout, agent teams for cross-checking
 - All commits and pushes happen automatically via nightly script and via this session
+
+### Session: 2026-02-07 — Nightly: Departure FP Suppression + Baseline Stability + Impact Tuning
+
+**Automated nightly analysis (agent team: log-analyst + code-reviewer + lead)**
+
+**Problems identified from Feb 6 logs:**
+1. **8 false departure alerts** out of 11 total — only 3 were real departures. False departures timed out every 30 min due to cooldown, then immediately re-triggered.
+2. **Light detector always returns "twilight"** — even at noon. The camera-through-window setup pulls mean brightness below 100 (the DAYLIGHT threshold), so the daylight departure suppression gate (`if light_conditions == 'daylight'`) NEVER fires. Neighboring car activity triggers false departures unchecked.
+3. **Baseline drift on timeout** — when DEPARTING times out, `establish_baseline()` was called with whatever random detection existed, causing the baseline to jump wildly (areas ranging from 945 to 167,608 pixels). Position (1481, 626) with area ~1000 appeared 4 times — clearly not the owner's car.
+4. **6 impact FPs** — all marked as FP by owner via "all null". Clustered between 12:59-13:12 (sustained environmental motion). 30s cooldown too short for sustained events.
+5. **13 "Event loop is closed" errors** — pre-existing Telegram async issue, not addressed (too risky for nightly fix).
+
+**Changes made:**
+
+#### `src/presence_tracker.py`
+- **Extended daylight gate to include twilight** (`_handle_present_state()`): Changed `if light_conditions == 'daylight'` to `if light_conditions in ('daylight', 'twilight')`. Since the camera always reports "twilight" during daytime, this makes the positive-identification requirement actually work. Departure signals from neighboring cars are now suppressed unless the owner's car was positively identified (plate/colour/model match). The `car_missing` and `position_shift` signals still bypass this check, so real departures aren't affected.
+- **Removed baseline update on DEPARTING timeout** (`_handle_departing_state()`): Previously re-established baseline with whatever detection existed at timeout — caused baseline to lock onto tiny false detections (area ~1000). Now keeps the existing known-good baseline. A timeout means the car DIDN'T leave, so the existing baseline is correct.
+- **Added minimum area check in `establish_baseline()`**: Rejects baseline updates where detection area < 5000 pixels with a warning log. The owner's car consistently shows areas >7,000+ at minimum. This prevents garden ornaments, bike racks, or edge detections from becoming the baseline.
+
+#### `config/config.yaml`
+- **Raised `motion_ratio_threshold` from 0.40 to 0.50** — 50% of car zone pixels must change. The 0.84-confidence FP (motion_ratio ~0.42) would be filtered. The five 1.00-confidence FPs would not (they need further investigation), but this catches borderline cases.
+- **Raised impact `cooldown_seconds` from 30 to 120** — the 4-event cluster within 3 minutes (13:09-13:12) showed 30s was too short for sustained environmental conditions. 120s prevents rapid-fire alerts during wind/shadow/construction events.
+- **Raised `departure_cooldown_after_timeout` from 1800 to 3600** (30 min → 60 min) — the afternoon showed 4 consecutive false departures at exactly 30-minute intervals. Real departures clear the cooldown (via `_last_departing_timeout_at = None` on ABSENT transition), so this has zero effect on real departure detection.
+
+**Expected impact:**
+- False departure alerts: 8 → likely 0-1 (twilight gate blocks unverified signals; longer cooldown as backup)
+- Impact FPs: 6 → likely 2-4 (cooldown reduces clusters, threshold catches borderline cases; high-confidence environmental FPs remain)
+- Baseline drift: eliminated for timeout case; area guard prevents tiny object baselines in all cases
+
+**Service restart required** to apply changes.
+
+**Known remaining issues:**
+- "Event loop is closed" Telegram errors (pre-existing, non-critical)
+- High-confidence (1.00) impact FPs from environmental motion still pass — may need algorithm refinement (frame-to-frame vs reference frame comparison)
+- Baseline on car return still locks onto small detections at (1481, 626) — needs investigation
+- Growing baseline image count (~120+ snapshots in data/baselines/) — needs cleanup policy
