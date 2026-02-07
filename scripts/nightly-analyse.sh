@@ -110,7 +110,6 @@ RULES:
 - Never change Telegram tokens, chat IDs, or security settings
 - Never delete recordings or user data
 - Keep changes minimal and focused
-- The service needs manual restart to apply code changes — note this in the commit message
 - If something blocks you, log it clearly and continue with what you can do
 - If this script itself has bugs, fix them
 PROMPT_END
@@ -173,6 +172,25 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>" >> "$LOG_FILE" 2>&1
     fi
 else
     log "Git: no changes detected"
+fi
+
+# Restart the service if any code/config changes were committed
+# (the whole point of nightly analysis is to improve the RUNNING system)
+if git log --since="1 hour ago" --oneline -- src/ config/ 2>/dev/null | grep -q .; then
+    log "Restarting car-monitor service to apply changes..."
+    if sudo systemctl restart car-monitor.service 2>> "$LOG_FILE"; then
+        sleep 3
+        if systemctl is-active --quiet car-monitor.service; then
+            log "Service restarted successfully"
+        else
+            log "=== WARNING: Service failed to start after restart ==="
+            journalctl -u car-monitor.service --since "2 minutes ago" --no-pager >> "$LOG_FILE" 2>&1
+        fi
+    else
+        log "=== ERROR: Failed to restart service ==="
+    fi
+else
+    log "No code/config changes — service restart not needed"
 fi
 
 # Prune old logs (keep last 30 days)

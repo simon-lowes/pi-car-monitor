@@ -488,8 +488,22 @@ The presence tracker entered DEPARTING state at 09:47 AM due to departure signal
 
 **Service restart required** to apply changes.
 
+**Service restarted:** Feb 7 by owner request — Feb 7 nightly fixes now live.
+
 **Known remaining issues:**
 - "Event loop is closed" Telegram errors (pre-existing, non-critical)
 - High-confidence (1.00) impact FPs from environmental motion still pass — may need algorithm refinement (frame-to-frame vs reference frame comparison)
 - Baseline on car return still locks onto small detections at (1481, 626) — needs investigation
 - Growing baseline image count (~120+ snapshots in data/baselines/) — needs cleanup policy
+
+### Session: 2026-02-07 — Fix: Nightly Script Must Restart Service
+
+**Problem:** The nightly script analysed logs, made fixes, committed and pushed — but never restarted the service. The Feb 7 3am fixes sat unrestarted for 12+ hours. The prompt even had a rule saying "The service needs manual restart" — explicitly telling the agents not to do it.
+
+**Changes made:**
+
+#### `scripts/nightly-analyse.sh`
+- **Added automatic service restart** after git operations: checks if any commits touched `src/` or `config/` in the last hour, and if so, restarts `car-monitor.service` via `sudo systemctl restart`. Verifies the service came back up and logs startup failures with recent journal output.
+- **Removed the "manual restart" rule** from the agent prompt — this was the root cause of the agents not restarting.
+
+**Service restarted** to apply all pending Feb 7 nightly fixes (departure FP suppression, baseline stability, impact tuning).
